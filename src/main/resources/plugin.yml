@@ -1,0 +1,10 @@
+name: MineSweeper
+version: '1'
+main: top.zhrhello.mineSweeper.MineSweeperPlugin
+api-version: '1.20'
+folia-supported: true
+commands:
+  sweeper:
+    description: 管理员扫雷作弊指令
+    usage: /sweeper <win|exit|see|list> [index]
+    permission: minesweeper.admin
