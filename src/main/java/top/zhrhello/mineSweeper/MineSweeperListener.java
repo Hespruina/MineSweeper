@@ -13,13 +13,21 @@ import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class MineSweeperListener implements Listener {
     private final MineSweeperPlugin plugin;
-    private final Map<UUID, MineSweeperGame> playerGames = new HashMap<>(); // 存储玩家和游戏的关联
+    // 存储玩家和游戏的关联（GUI 配置阶段使用）。
+    // 使用 ConcurrentHashMap 仅为与插件整体并发风格保持一致；事件均在主线程触发。
+    private final Map<UUID, MineSweeperGame> playerGames = new ConcurrentHashMap<>();
+    // 标记"程序化重开 GUI"的关闭事件：切换开关/难度时会先关闭再重开，
+    // 此时不应清理 playerGames 关联，否则重开后点击会找不到游戏。
+    private final Set<UUID> reopeningGUI = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     public MineSweeperListener(MineSweeperPlugin plugin) {
         this.plugin = plugin;
@@ -98,9 +106,10 @@ public class MineSweeperListener implements Listener {
         event.setCancelled(true);
 
         if (event.getAction() == Action.LEFT_CLICK_BLOCK) {
-            game.handleLeftClick(loc, event.getPlayer()); // 确保参数为 Location 和 Player
+            game.handleLeftClick(loc, event.getPlayer());
         } else {
-            game.handleRightClick(loc, event.getPlayer()); // 确保参数为 Location 和 Player
+            // 空手右键客户端不发送事件，因此拦截所有手持物品右键作为插旗
+            game.handleRightClick(loc, event.getPlayer());
         }
     }
 
@@ -234,9 +243,11 @@ public class MineSweeperListener implements Listener {
                 if (slot == 13) {
                     game.toggleAutoFlag();
                     player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 1.0f, 1.0f);
-                    // 刷新GUI
+                    // 刷新GUI：先标记重开，关闭触发 InventoryCloseEvent 时不会被误清理
+                    reopeningGUI.add(player.getUniqueId());
                     player.closeInventory();
                     game.createTutorialGUI(player);
+                    reopeningGUI.remove(player.getUniqueId());
                     return;
                 }
                 
@@ -245,9 +256,11 @@ public class MineSweeperListener implements Listener {
                     int difficulty = slot - 17; // 1=简单 2=中等 3=困难
                     game.setDifficulty(difficulty);
                     player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 1.0f, 1.0f);
-                    // 刷新GUI
+                    // 刷新GUI：同上，避免关闭事件误清理关联
+                    reopeningGUI.add(player.getUniqueId());
                     player.closeInventory();
                     game.createTutorialGUI(player);
+                    reopeningGUI.remove(player.getUniqueId());
                     return;
                 }
                 
@@ -257,11 +270,41 @@ public class MineSweeperListener implements Listener {
                     player.sendMessage(ChatColor.GREEN + "游戏已启动！左键揭示，右键插旗");
                     player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.0f, 1.0f);
                     // 移除玩家与游戏的关联，因为游戏已经启动
+                    // （关闭事件也会清理，这里作为兜底）
                     playerGames.remove(player.getUniqueId());
                     return;
                 }
             }
         }
+    }
+
+    // 判断某个 Inventory 是否为我们的教学/设置 GUI（27 格且启动按钮为 TNT）
+    private boolean isOurGUI(Inventory inventory) {
+        if (inventory == null || inventory.getSize() != 27) return false;
+        ItemStack item = inventory.getItem(26);
+        return item != null && item.getType() == Material.TNT;
+    }
+
+    // 玩家关闭 GUI：无论是按 ESC 退出、被其他插件强制关闭，还是正常启动游戏，
+    // 只要关闭的是我们的 GUI 且不是"程序化重开"，就清理 playerGames 关联，
+    // 避免 MineSweeperGame 对象被 Map 一直引用而无法被 GC 回收。
+    @EventHandler
+    public void onInventoryClose(InventoryCloseEvent event) {
+        if (!(event.getPlayer() instanceof Player)) return;
+        Player player = (Player) event.getPlayer();
+
+        if (!isOurGUI(event.getInventory())) return;
+
+        // 切换开关/难度时的"先关后开"属于程序化重开，不应清理关联
+        if (reopeningGUI.contains(player.getUniqueId())) return;
+
+        playerGames.remove(player.getUniqueId());
+    }
+
+    // 玩家退出服务器：无论其 GUI 是否关闭，都清理关联，防止内存泄漏。
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        playerGames.remove(event.getPlayer().getUniqueId());
     }
 
 }

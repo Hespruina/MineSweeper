@@ -19,71 +19,113 @@ public final class MineSweeperPlugin extends JavaPlugin {
     private final List<MineSweeperGame> activeGames = new CopyOnWriteArrayList<>();
     private final Map<org.bukkit.Location, MineSweeperGame> locationToGame = new ConcurrentHashMap<>();
 
+    // Folia 检测缓存，避免每次调用都反射
+    private static volatile Boolean isFolia = null;
+    
+    /**
+     * 检测当前是否运行在 Folia 服务端。
+     * Folia 有 RegionizedServer 类，Paper/Spigot 没有。
+     */
+    static boolean isFolia() {
+        if (isFolia != null) {
+            return isFolia;
+        }
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            isFolia = true;
+        } catch (ClassNotFoundException e) {
+            isFolia = false;
+        }
+        return isFolia;
+    }
+    
+    /**
+     * 在正确的线程上执行任务 — 自动适配 Folia / Paper。
+     * 
+     * - Folia: 使用 RegionScheduler 在区块所在区域的主线程上执行
+     * - Paper/Spigot: 如果当前已在主线程则直接执行，否则通过 runTask 调度到主线程
+     * 
+     * @param location 用于确定 Folia 区域的 Location（Paper 上可为 null）
+     * @param task 需要执行的 Runnable
+     */
+    void executeOnMainThread(Location location, Runnable task) {
+        if (isFolia()) {
+            // Folia: 必须通过区域调度器执行（1.20.1 API 中 execute 接受 Runnable）
+            if (location != null && location.isWorldLoaded()) {
+                getServer().getRegionScheduler().execute(this, location.getWorld(),
+                        location.getBlockX() >> 4, location.getBlockZ() >> 4,
+                        task);
+            } else {
+                getServer().getGlobalRegionScheduler().execute(this, task);
+            }
+        } else {
+            // Paper/Spigot: 主线程检查 + 必要时调度
+            if (org.bukkit.Bukkit.isPrimaryThread()) {
+                task.run();
+            } else {
+                getServer().getScheduler().runTask(this, task);
+            }
+        }
+    }
+
     @Override
     public void onEnable() {
+        // 预热 Folia 检测
+        isFolia();
+        
         // 注册事件监听器
         getServer().getPluginManager().registerEvents(new MineSweeperListener(this), this);
 
-        // 启动超时检查任务 (每20 ticks/1秒检查)
-        try {
-            // 尝试使用Folia的区域调度器
-            getClass().getClassLoader().loadClass("io.papermc.paper.threadedregions.RegionizedServer");
-            // 如果我们能加载到Folia的类，就使用全局区域调度
+        // 启动超时检查任务 (每20 ticks/1秒)
+        // 定时器本体可在任意线程运行，但世界操作通过 executeOnMainThread 保证在主线程执行
+        if (isFolia()) {
             getServer().getGlobalRegionScheduler().runAtFixedRate(this, (task) -> {
-                long currentTime = System.currentTimeMillis();
-                for (MineSweeperGame game : new CopyOnWriteArrayList<>(activeGames)) {
-                    // 检查无操作超时（60秒）
-                    if (game.isActive() && !game.isWaitingForExit() && (currentTime - game.getLastActivityTime() > 60_000)) {
-                        // 使用实体调度器在主线程中执行endGame
-                        if (!game.getPlatformBlocks().isEmpty()) {
-                            org.bukkit.Location loc = game.getPlatformBlocks().iterator().next();
-                            getServer().getRegionScheduler().execute(this, loc.getWorld(), 
-                                    loc.getBlockX() >> 4, loc.getBlockZ() >> 4, 
-                                    () -> game.endGame(false));
-                        }
-                    }
-                    // 处理退出倒计时
-                    if (game.isWaitingForExit()) {
-                        game.decrementExitCountdown();
-                        // 使用实体调度器在主线程中显示倒计时
-                        if (!game.getPlatformBlocks().isEmpty()) {
-                            org.bukkit.Location loc = game.getPlatformBlocks().iterator().next();
-                            getServer().getRegionScheduler().execute(this, loc.getWorld(), 
-                                    loc.getBlockX() >> 4, loc.getBlockZ() >> 4, 
-                                    game::showCountdownToPlayers);
-                        }
-                        if (game.getExitCountdown() <= 0) {
-                            // 使用实体调度器在主线程中执行endGame
-                            if (!game.getPlatformBlocks().isEmpty()) {
-                                org.bukkit.Location loc = game.getPlatformBlocks().iterator().next();
-                                getServer().getRegionScheduler().execute(this, loc.getWorld(), 
-                                        loc.getBlockX() >> 4, loc.getBlockZ() >> 4, 
-                                        () -> game.endGame(false));
-                            }
-                        }
+                tickGames();
+            }, 20L, 20L);
+        } else {
+            // Paper/Spigot: 直接使用同步定时器，回调已在主线程
+            getServer().getScheduler().runTaskTimer(this, () -> {
+                tickGames();
+            }, 20L, 20L);
+        }
+    }
+    
+    /**
+     * 处理所有活跃游戏的超时检查和倒计时。
+     * Folia 上从 GlobalRegionScheduler（异步）调用，世界操作需通过 executeOnMainThread 转发。
+     * Paper 上从 runTaskTimer（主线程）调用，世界操作可直接执行。
+     */
+    private void tickGames() {
+        long currentTime = System.currentTimeMillis();
+        for (MineSweeperGame game : new CopyOnWriteArrayList<>(activeGames)) {
+            // 检查无操作超时（60秒）
+            if (game.isActive() && !game.isWaitingForExit() && (currentTime - game.getLastActivityTime() > 60_000)) {
+                if (!game.getPlatformBlocks().isEmpty()) {
+                    Location loc = game.getPlatformBlocks().iterator().next();
+                    executeOnMainThread(loc, () -> game.endGame(false));
+                }
+            }
+            // 处理退出倒计时
+            if (game.isWaitingForExit()) {
+                game.decrementExitCountdown();
+                if (!game.getPlatformBlocks().isEmpty()) {
+                    Location loc = game.getPlatformBlocks().iterator().next();
+                    executeOnMainThread(loc, game::showCountdownToPlayers);
+                }
+                if (game.getExitCountdown() <= 0) {
+                    if (!game.getPlatformBlocks().isEmpty()) {
+                        Location loc = game.getPlatformBlocks().iterator().next();
+                        executeOnMainThread(loc, () -> game.endGame(false));
                     }
                 }
-            }, 20L, 20L);
-        } catch (ClassNotFoundException e) {
-            // 回退到传统的Bukkit调度器
-            getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
-                long currentTime = System.currentTimeMillis();
-                for (MineSweeperGame game : new CopyOnWriteArrayList<>(activeGames)) {
-                    // 检查无操作超时（60秒）
-                    if (game.isActive() && !game.isWaitingForExit() && (currentTime - game.getLastActivityTime() > 60_000)) {
-                        game.endGame(false);
-                    }
-                    // 处理退出倒计时
-                    if (game.isWaitingForExit()) {
-                        game.decrementExitCountdown();
-                        // 在Bukkit环境下直接调用显示倒计时
-                        game.showCountdownToPlayers();
-                        if (game.getExitCountdown() <= 0) {
-                            game.endGame(false);
-                        }
-                    }
+            }
+            // ActionBar 视线提示 — 对活跃游戏每 tick 更新
+            if (game.isActive() && !game.isWaitingForExit()) {
+                if (!game.getPlatformBlocks().isEmpty()) {
+                    Location loc = game.getPlatformBlocks().iterator().next();
+                    executeOnMainThread(loc, game::updatePlayerActionBars);
                 }
-            }, 20L, 20L);
+            }
         }
     }
 
