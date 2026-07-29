@@ -6,5 +6,5 @@ folia-supported: true
 commands:
   sweeper:
     description: 管理员扫雷作弊指令
-    usage: /sweeper <win|exit|see|list> [index]
+    usage: /sweeper <win|exit|see|list|reload> [index]
     permission: minesweeper.admin

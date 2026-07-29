@@ -13,11 +13,21 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import top.zhrhello.mineSweeper.config.ConfigManager;
+import top.zhrhello.mineSweeper.logic.LogicEngine;
+import top.zhrhello.mineSweeper.logic.Persistence;
+import top.zhrhello.mineSweeper.rewards.RewardManager;
 
 public final class MineSweeperPlugin extends JavaPlugin {
     // 线程安全的游戏存储
     private final List<MineSweeperGame> activeGames = new CopyOnWriteArrayList<>();
     private final Map<org.bukkit.Location, MineSweeperGame> locationToGame = new ConcurrentHashMap<>();
+
+    // 可编程奖励系统与 Logic 引擎
+    private ConfigManager configManager;
+    private Persistence persistence;
+    private LogicEngine logicEngine;
+    private RewardManager rewardManager;
 
     // Folia 检测缓存，避免每次调用都反射
     private static volatile Boolean isFolia = null;
@@ -26,7 +36,7 @@ public final class MineSweeperPlugin extends JavaPlugin {
      * 检测当前是否运行在 Folia 服务端。
      * Folia 有 RegionizedServer 类，Paper/Spigot 没有。
      */
-    static boolean isFolia() {
+    public static boolean isFolia() {
         if (isFolia != null) {
             return isFolia;
         }
@@ -75,6 +85,22 @@ public final class MineSweeperPlugin extends JavaPlugin {
         
         // 注册事件监听器
         getServer().getPluginManager().registerEvents(new MineSweeperListener(this), this);
+
+        // 初始化可编程奖励系统与 Logic 逻辑引擎
+        this.persistence = new Persistence(getDataFolder());
+        this.configManager = new ConfigManager(this, persistence);
+        this.logicEngine = new LogicEngine(configManager, persistence, this);
+        this.rewardManager = new RewardManager(this, configManager, logicEngine);
+        ConfigManager.ReloadResult rr = configManager.reload();
+        if (rr.success) {
+            getLogger().info("[MineSweeper] 配置加载成功：函数 " + rr.functionCount + " 个，动作 "
+                    + rr.actionCount + " 个，持久化条目 " + rr.persistenceCount + " 个"
+                    + (rr.warnings.isEmpty() ? "" : "（警告 " + rr.warnings.size() + " 条）"));
+            for (String w : rr.warnings) getLogger().warning("[MineSweeper] 配置警告: " + w);
+        } else {
+            getLogger().severe("[MineSweeper] 配置加载失败，使用空配置运行：");
+            for (String e : rr.errors) getLogger().severe("  - " + e);
+        }
 
         // 启动超时检查任务 (每20 ticks/1秒)
         // 定时器本体可在任意线程运行，但世界操作通过 executeOnMainThread 保证在主线程执行
@@ -132,8 +158,30 @@ public final class MineSweeperPlugin extends JavaPlugin {
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (command.getName().equalsIgnoreCase("sweeper")) {
+            // 热重载配置（权限 minesweeper.admin，控制台不受限）
+            if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
+                if (sender instanceof Player && !sender.hasPermission("minesweeper.admin")) {
+                    sender.sendMessage(ChatColor.RED + "你没有权限执行该命令");
+                    return true;
+                }
+                ConfigManager.ReloadResult rr = configManager.reload();
+                if (rr.success) {
+                    sender.sendMessage(ChatColor.GREEN + "配置热重载成功！");
+                    sender.sendMessage(ChatColor.YELLOW + "函数: " + rr.functionCount
+                            + " | 动作: " + rr.actionCount + " | 持久化条目: " + rr.persistenceCount);
+                    if (!rr.warnings.isEmpty()) {
+                        sender.sendMessage(ChatColor.GOLD + "警告 " + rr.warnings.size() + " 条：");
+                        for (String w : rr.warnings) sender.sendMessage(ChatColor.GRAY + "  - " + w);
+                    }
+                } else {
+                    sender.sendMessage(ChatColor.RED + "配置重载失败，已保留旧配置。错误：");
+                    for (String e : rr.errors) sender.sendMessage(ChatColor.RED + "  - " + e);
+                }
+                return true;
+            }
+
             if (args.length == 0) {
-                sender.sendMessage(ChatColor.RED + "用法: /sweeper <win|exit|see|list> [序号]");
+                sender.sendMessage(ChatColor.RED + "用法: /sweeper <win|exit|see|list|reload> [序号]");
                 return true;
             }
             
@@ -236,6 +284,12 @@ public final class MineSweeperPlugin extends JavaPlugin {
         
         return false;
     }
+
+    // 添加新游戏
+    public ConfigManager getConfigManager() { return configManager; }
+    public Persistence getPersistence() { return persistence; }
+    public LogicEngine getLogicEngine() { return logicEngine; }
+    public RewardManager getRewardManager() { return rewardManager; }
 
     // 添加新游戏
     public void addGame(MineSweeperGame game) {

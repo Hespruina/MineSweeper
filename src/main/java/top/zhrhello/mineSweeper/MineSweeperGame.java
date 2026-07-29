@@ -9,6 +9,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.FluidCollisionMode;
+import top.zhrhello.mineSweeper.logic.GameContext;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -29,6 +30,7 @@ public class MineSweeperGame {
     private boolean autoFlagEnabled = false; // 自动标记开关
     private int customMineCount; // 自定义雷数
     private int difficulty = 1; // 难度等级 1=简单 2=中等 3=困难
+    private Player lastActor;    // 最近操作游戏的玩家（用于奖励上下文）
 
     public MineSweeperGame(MineSweeperPlugin plugin, Set<Location> platformBlocks, Location startLocation) {
         this.plugin = plugin;
@@ -116,6 +118,7 @@ public class MineSweeperGame {
         if (loc == null || player == null) {
             return;
         }
+        this.lastActor = player;
         
         if (!active || waitingForExit) {
             lastActivityTime = System.currentTimeMillis();
@@ -187,7 +190,7 @@ public class MineSweeperGame {
         // 检查胜利
         if (checkWin()) {
             endGame(true);
-            player.sendMessage(ChatColor.GOLD + "扫雷成功！奖励箱已生成");
+            player.sendMessage(ChatColor.GOLD + "扫雷成功！");
             player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1.0f, 1.0f);
         }
     }
@@ -386,7 +389,7 @@ public class MineSweeperGame {
         // 检查胜利
         if (checkWin()) {
             endGame(true);
-            player.sendMessage(ChatColor.GOLD + "扫雷成功！奖励箱已生成");
+            player.sendMessage(ChatColor.GOLD + "扫雷成功！");
         }
     }
 
@@ -459,6 +462,7 @@ public class MineSweeperGame {
         if (loc == null || player == null) {
             return;
         }
+        this.lastActor = player;
 
         if (!active || waitingForExit) {
             lastActivityTime = System.currentTimeMillis();
@@ -572,153 +576,19 @@ public class MineSweeperGame {
         flaggedBlocks.clear();
         revealedBlocks.clear();
 
-        // 生成奖励
+        // 触发可编程奖励系统（具体行为由 config.yml 中 rewards.win / rewards.lose 决定）
+        GameContext rewardContext = new GameContext(lastActor, difficulty, platformBlocks.size(),
+                customMineCount, autoFlagEnabled, platformBlocks);
         if (success) {
-            generateRewardChest();
-        }
-    }
-
-    private void generateRewardChest() {
-        // 找一个安全位置 (上方为空气)
-        List<Location> validSpots = new ArrayList<>();
-        for (Location loc : platformBlocks) {
-            Location chestLoc = loc.clone().add(0, 1, 0);
-            if (chestLoc.getBlock().getType() == Material.AIR) {
-                validSpots.add(chestLoc);
-            }
-        }
-
-        if (validSpots.isEmpty()) return;
-
-        // 生成箱子
-        Location chestLoc = validSpots.get(ThreadLocalRandom.current().nextInt(validSpots.size()));
-        chestLoc.getBlock().setType(Material.CHEST);
-
-        // 填充奖励
-        Chest chest = (Chest) chestLoc.getBlock().getState();
-        Inventory inv = chest.getInventory();
-        
-        // 基础奖励 - 始终给予TNT
-        inv.addItem(new ItemStack(Material.TNT, 1));
-        
-        // 计算奖励等级
-        int rewardLevel = calculateRewardLevel();
-        
-        // 根据奖励等级和随机权重添加额外奖励
-        addWeightedRewards(inv, rewardLevel);
-    }
-
-    // 计算奖励等级
-    private int calculateRewardLevel() {
-        int rewardLevel = 0;
-        int platformSize = platformBlocks.size();
-        
-        // 难度奖励
-        switch (difficulty) {
-            case 1: rewardLevel = 1; break; // 简单
-            case 2: rewardLevel = 2; break; // 中等
-            case 3: rewardLevel = 3; break; // 困难
-        }
-        
-        // 自动标记惩罚（减少奖励）
-        if (autoFlagEnabled) {
-            rewardLevel = Math.max(0, rewardLevel - 1);
-        }
-        
-        // 平台大小奖励
-        if (platformSize > 100) {
-            rewardLevel += 1;
-        } else if (platformSize > 50) {
-            rewardLevel += 0;
+            plugin.getRewardManager().executeFlow("win", rewardContext);
         } else {
-            rewardLevel -= 1;
-        }
-        
-        return rewardLevel;
-    }
-    
-    // 权重表中"随机混凝土"条目的固定查表键。
-    // 仅作为 HashMap 的 key 使用（Material 是枚举，equals/ hashCode 稳定），
-    // 实际发放奖励时再调用 getRandomConcrete() 随机选取具体颜色，
-    // 避免在权重表与查找逻辑里反复 new 数组并用 == 引用比较的歧义写法。
-    private static final Material CONCRETE_REWARD_KEY = Material.WHITE_CONCRETE;
-
-    // 基于权重和奖励等级添加奖励
-    private void addWeightedRewards(Inventory inventory, int rewardLevel) {
-        Map<Material, int[]> rewardWeights = buildRewardWeights();
-
-        // 遍历奖励表
-        for (Map.Entry<Material, int[]> entry : rewardWeights.entrySet()) {
-            Material material = entry.getKey();
-            int[] weights = entry.getValue();
-
-            // 确保奖励等级在有效范围内
-            if (rewardLevel >= 0 && rewardLevel < weights.length) {
-                int weight = weights[rewardLevel];
-
-                // 根据权重决定是否添加奖励
-                if (ThreadLocalRandom.current().nextInt(100) < weight) {
-                    // 混凝土条目用固定键查表，实际发放时随机一种颜色
-                    Material materialToGrant = (material == CONCRETE_REWARD_KEY) ? getRandomConcrete() : material;
-                    // 根据难度和权重确定数量（数量计算仍基于查表键，保证逻辑一致）
-                    int amount = calculateRewardAmount(material, rewardLevel);
-                    if (amount > 0) {
-                        inventory.addItem(new ItemStack(materialToGrant, amount));
-                    }
-                }
-            }
+            plugin.getRewardManager().executeFlow("lose", rewardContext);
         }
     }
 
-    // 奖励权重表（key 为固定 Material，混凝土用 CONCRETE_REWARD_KEY 占位）
-    // 供 addWeightedRewards 与 getRewardWeight 共用，避免重复构造与歧义比较。
-    private static Map<Material, int[]> buildRewardWeights() {
-        Map<Material, int[]> rewardWeights = new HashMap<>();
-        rewardWeights.put(CONCRETE_REWARD_KEY, new int[]{20, 40, 60, 80}); // 随机混凝土
-        rewardWeights.put(Material.IRON_INGOT, new int[]{0, 30, 50, 70}); // 铁锭
-        rewardWeights.put(Material.GOLD_INGOT, new int[]{0, 0, 20, 40}); // 金锭
-        rewardWeights.put(Material.DIAMOND, new int[]{0, 0, 5, 15}); // 钻石
-        return rewardWeights;
-    }
-    
-    // 根据物品类型、奖励等级计算奖励数量
-    private int calculateRewardAmount(Material material, int rewardLevel) {
-        // 基础数量基于奖励等级
-        int baseAmount = 0;
-        switch (rewardLevel) {
-            case 1: baseAmount = ThreadLocalRandom.current().nextInt(1, 3); break;
-            case 2: baseAmount = ThreadLocalRandom.current().nextInt(1, 4); break;
-            case 3: baseAmount = ThreadLocalRandom.current().nextInt(2, 5); break;
-            case 4: baseAmount = ThreadLocalRandom.current().nextInt(2, 6); break;
-            default: baseAmount = 1;
-        }
-        
-        // 根据物品类型调整数量
-        if (material == Material.DIAMOND) {
-            // 钻石奖励较少
-            return ThreadLocalRandom.current().nextInt(1, Math.max(2, baseAmount));
-        } else if (material == Material.GOLD_INGOT) {
-            // 金锭适中
-            return ThreadLocalRandom.current().nextInt(1, baseAmount + 1);
-        } else if (material == Material.IRON_INGOT) {
-            // 铁锭较多
-            return ThreadLocalRandom.current().nextInt(1, baseAmount + 2);
-        } else {
-            // 混凝土等其他材料最多
-            return ThreadLocalRandom.current().nextInt(1, baseAmount + 3);
-        }
-    }
-
-    private Material getRandomConcrete() {
-        Material[] concretes = {
-                Material.WHITE_CONCRETE, Material.ORANGE_CONCRETE, Material.MAGENTA_CONCRETE,
-                Material.LIGHT_BLUE_CONCRETE, Material.YELLOW_CONCRETE, Material.LIME_CONCRETE,
-                Material.PINK_CONCRETE, Material.GRAY_CONCRETE, Material.LIGHT_GRAY_CONCRETE,
-                Material.CYAN_CONCRETE, Material.PURPLE_CONCRETE, Material.BLUE_CONCRETE,
-                Material.BROWN_CONCRETE, Material.GREEN_CONCRETE, Material.RED_CONCRETE, Material.BLACK_CONCRETE
-        };
-        return concretes[ThreadLocalRandom.current().nextInt(concretes.length)];
-    }
+    // ===== 硬编码奖励逻辑已移除：奖励完全由 config.yml 的 rewards / logic 配置驱动 =====
+    // 原 generateRewardChest / calculateRewardLevel / addWeightedRewards 等方法已删除，
+    // 胜利/失败奖励改由 MineSweeperGame.endGame 调用 RewardManager.executeFlow 完成。
 
     // 显示退出倒计时给玩家
     private void showExitCountdown(Player player) {
@@ -824,7 +694,7 @@ public class MineSweeperGame {
         addItem(gui, 26, Material.TNT, "启动游戏", 
                 "难度: " + getDifficultyColor() + getDifficultyName(),
                 "自动标记: " + getAutoFlagStatusText(),
-                "预计奖励: " + ChatColor.GOLD + calculateRewardPreview(),
+                "预计奖励: " + ChatColor.GOLD + "由 config.yml 配置",
                 "点击启动游戏");
 
         player.openInventory(gui);
@@ -872,44 +742,7 @@ public class MineSweeperGame {
         }
     }
 
-    // 计算奖励预览
-    public String calculateRewardPreview() {
-        StringBuilder preview = new StringBuilder();
-        
-        // 基础奖励
-        preview.append("基础奖励: 1xTNT");
-        
-        // 计算奖励等级
-        int rewardLevel = calculateRewardLevel();
-        
-        // 添加可能的奖励预览
-        if (rewardLevel >= 1) {
-            preview.append(", 混凝土(权重: ").append(getRewardWeight(CONCRETE_REWARD_KEY, rewardLevel)).append("%)");
-        }
-        
-        if (rewardLevel >= 2) {
-            preview.append(", 铁锭(权重: ").append(getRewardWeight(Material.IRON_INGOT, rewardLevel)).append("%)");
-        }
-        
-        if (rewardLevel >= 3) {
-            preview.append(", 金锭(权重: ").append(getRewardWeight(Material.GOLD_INGOT, rewardLevel)).append("%)");
-        }
-        
-        if (rewardLevel >= 4) {
-            preview.append(", 钻石(权重: ").append(getRewardWeight(Material.DIAMOND, rewardLevel)).append("%)");
-        }
-        
-        return preview.toString();
-    }
-
-    // 获取指定物品和奖励等级的权重
-    private int getRewardWeight(Material material, int rewardLevel) {
-        int[] weights = buildRewardWeights().get(material);
-        if (weights != null && rewardLevel >= 0 && rewardLevel < weights.length) {
-            return weights[rewardLevel];
-        }
-        return 0;
-    }
+    // ===== 奖励预览方法已移除：奖励内容完全由 config.yml 决定，无需硬编码预览 =====
 
     // 获取难度名称
     public String getDifficultyName() {
