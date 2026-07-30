@@ -9,6 +9,7 @@
 
 module jiangli
     // 读取游戏上下文
+    get_player -> player
     get_difficulty -> diff
     get_platform_size -> size
     get_auto_flag -> autoflag
@@ -49,7 +50,33 @@ module jiangli
 
     set gold = floor(raw_gold * factor)
 
-    // 任何人皆可获得金币，直接返回
+    // ==================== 每日单人货币上限 ====================
+    // 每名玩家每天最多获取 daily_coin_cap（默认 1000）货币；累计值按 "玩家名+日期" 持久化，
+    // 跨服务器重启仍保留，次日（日期变化）自动重置。
+    set DAILY_CAP = global.daily_coin_cap
+    set today = date()
+    set dkey = "daily_coin_" + player + "_" + today
+    store_get dkey -> earned_raw
+    to_number earned_raw -> earned
+
+    if earned >= DAILY_CAP then
+        // 今日已达上限，本次不再发放货币
+        set gold = 0
+        send_message "&c你今日已触达货币获取上限（" + DAILY_CAP + "/天），本次奖励的货币部分被限制。"
+    else
+        set remain = DAILY_CAP - earned
+        if gold > remain then
+            // 部分发放，凑满当日上限
+            set gold = remain
+            store_set dkey, DAILY_CAP
+            send_message "&c你今日货币获取已接近上限，本次仅发放 " + gold + "（今日累计 " + DAILY_CAP + "）。"
+        else
+            // 正常累加
+            store_set dkey, earned + gold
+        end if
+    end if
+
+    // 任何人皆可获得金币（已含每日上限处理），直接返回
     return gold
 end module
 

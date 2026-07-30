@@ -329,4 +329,12 @@ public final class MineSweeperPlugin extends JavaPlugin {
     public Set<Location> getAllGameLocations() {
         return new HashSet<>(locationToGame.keySet());
     }
+
+    @Override
+    public void onDisable() {
+        // 关停前确保持久化落盘完成，避免丢失最后一次写入（每日上限累计值等）
+        if (persistence != null) {
+            persistence.flush();
+        }
+    }
 }

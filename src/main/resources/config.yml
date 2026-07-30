@@ -37,3 +37,4 @@ logic:
   max_eval_ms: 50
   constants:
     base_eco: 100
+    daily_coin_cap: 1000   # 每名玩家每天最多获取的货币上限（可在 rewards.lgs 中读取 global.daily_coin_cap）

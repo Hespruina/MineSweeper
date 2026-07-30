@@ -665,7 +665,7 @@ map_keys weights -> names                                // names = ["WHITE_CONC
 
 ### 9.8 持久化存储
 
-持久化数据**跨服务器重启保留**，存储在 `plugins/MineSweeper/persistence.yml`。
+持久化数据**跨服务器重启保留**，存储在 `plugins/MineSweeper/data.yml`。
 
 #### `store_set`
 - 参数：`key` (String), `value` (Any)
