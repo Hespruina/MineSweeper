@@ -13,6 +13,7 @@ import top.zhrhello.mineSweeper.MineSweeperPlugin;
 import top.zhrhello.mineSweeper.config.ConfigManager;
 import top.zhrhello.mineSweeper.config.RewardAction;
 import top.zhrhello.mineSweeper.config.RewardFlow;
+import top.zhrhello.mineSweeper.folia.SchedulerCompat;
 import top.zhrhello.mineSweeper.logic.Expression;
 import top.zhrhello.mineSweeper.logic.GameContext;
 import top.zhrhello.mineSweeper.logic.LogicEngine;
@@ -51,6 +52,18 @@ public class RewardManager {
     // ===================== 流程执行 =====================
 
     public void executeFlow(String flowName, GameContext gameCtx) {
+        // 整个奖励流程在玩家所在 region 线程执行（Folia），保证后续 play_sound / give_item /
+        // player_command / give_chest 等动作的玩家/世界访问都在正确线程。
+        // 无玩家上下文时回退全局区域线程（仅适合无世界访问的动作）。
+        Player p = (gameCtx != null) ? gameCtx.player : null;
+        if (p != null) {
+            SchedulerCompat.runOnEntity(plugin, p, () -> executeFlowInternal(flowName, gameCtx));
+        } else {
+            SchedulerCompat.runOnGlobal(plugin, () -> executeFlowInternal(flowName, gameCtx));
+        }
+    }
+
+    private void executeFlowInternal(String flowName, GameContext gameCtx) {
         List<RewardFlow> flows = config.getRewardFlows(flowName);
         if (flows == null || flows.isEmpty()) return;
 
@@ -96,12 +109,14 @@ public class RewardManager {
                 int ticks = parseAmount(action.params.get("ticks"));
                 if (ticks > 0) {
                     final int next = i + 1;
-                    if (MineSweeperPlugin.isFolia()) {
-                        plugin.getServer().getGlobalRegionScheduler().runDelayed(plugin,
-                                (task) -> runActions(actions, ac, next), (long) ticks);
+                    Player p = (ac.gameCtx != null) ? ac.gameCtx.player : null;
+                    Runnable resume = () -> runActions(actions, ac, next);
+                    // 延迟后在玩家区域线程继续（保证后续玩家/世界访问线程正确）；
+                    // 无玩家时用异步线程（后续动作中的世界访问需自行通过 runOnRegionOwned 路由）
+                    if (p != null) {
+                        SchedulerCompat.runOnEntityDelayed(plugin, p, resume, ticks);
                     } else {
-                        plugin.getServer().getScheduler().runTaskLater(plugin,
-                                () -> runActions(actions, ac, next), ticks);
+                        SchedulerCompat.runAsyncDelayed(plugin, resume, ticks);
                     }
                     return;
                 }
@@ -179,24 +194,23 @@ public class RewardManager {
             ac.plugin.getLogger().warning("[Reward] give_chest 缺少平台信息，已跳过");
             return;
         }
-        Location chestLoc = null;
+        // 在每个候选位置所属 region 线程查找空气并放置箱子（支持平台跨 region）。
+        // 用 AtomicBoolean 保证只放置一个箱子。
+        java.util.concurrent.atomic.AtomicBoolean placed = new java.util.concurrent.atomic.AtomicBoolean(false);
         for (Location loc : g.platformBlocks) {
+            if (placed.get()) break;
             Location up = loc.clone().add(0, 1, 0);
-            if (up.getBlock().getType() == Material.AIR) {
-                chestLoc = up;
-                break;
-            }
+            SchedulerCompat.runOnRegionOwned(ac.plugin, up, () -> {
+                if (placed.get()) return;
+                if (up.getBlock().getType() != Material.AIR) return;
+                if (!placed.compareAndSet(false, true)) return;
+                up.getBlock().setType(Material.CHEST);
+                Chest chest = (Chest) up.getBlock().getState();
+                Inventory inv = chest.getInventory();
+                Object ret = ac.engine.execute(funcName, new ArrayList<>(), g);
+                fillChest(inv, ret, ac);
+            });
         }
-        if (chestLoc == null) {
-            ac.plugin.getLogger().warning("[Reward] give_chest 未找到可放置箱子的位置（平台上方均非空气）");
-            return;
-        }
-        chestLoc.getBlock().setType(Material.CHEST);
-        Chest chest = (Chest) chestLoc.getBlock().getState();
-        Inventory inv = chest.getInventory();
-
-        Object ret = ac.engine.execute(funcName, new ArrayList<>(), g);
-        fillChest(inv, ret, ac);
     }
 
     private void fillChest(Inventory inv, Object ret, ActionContext ac) {

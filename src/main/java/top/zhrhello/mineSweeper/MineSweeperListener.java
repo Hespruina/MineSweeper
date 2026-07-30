@@ -22,6 +22,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import top.zhrhello.mineSweeper.folia.SchedulerCompat;
 
 public class MineSweeperListener implements Listener {
     private final MineSweeperPlugin plugin;
@@ -119,6 +120,9 @@ public class MineSweeperListener implements Listener {
                 Location next = loc.clone().add(face.getModX(), face.getModY(), face.getModZ());
                 if (next.getWorld().equals(loc.getWorld()) &&
                         next.getBlockY() == loc.getBlockY() &&
+                        // Folia: 仅检测当前线程拥有的方块（玩家所在 region），跨 region 方块跳过以防崩溃；
+                        // Paper: isOwnedByCurrentRegion 恒等于主线程判断，事件线程中为 true，不影响检测。
+                        SchedulerCompat.isOwnedByCurrentRegion(next) &&
                         next.getBlock().getType() == Material.GRAY_CONCRETE &&
                         !platform.contains(next)) {
                     platform.add(next.clone());

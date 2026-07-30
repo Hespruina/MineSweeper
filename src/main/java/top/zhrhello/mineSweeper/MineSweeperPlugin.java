@@ -14,6 +14,7 @@ import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import top.zhrhello.mineSweeper.config.ConfigManager;
+import top.zhrhello.mineSweeper.folia.SchedulerCompat;
 import top.zhrhello.mineSweeper.logic.LogicEngine;
 import top.zhrhello.mineSweeper.logic.Persistence;
 import top.zhrhello.mineSweeper.rewards.RewardManager;
@@ -29,60 +30,29 @@ public final class MineSweeperPlugin extends JavaPlugin {
     private LogicEngine logicEngine;
     private RewardManager rewardManager;
 
-    // Folia 检测缓存，避免每次调用都反射
-    private static volatile Boolean isFolia = null;
-    
     /**
-     * 检测当前是否运行在 Folia 服务端。
-     * Folia 有 RegionizedServer 类，Paper/Spigot 没有。
+     * 检测当前是否运行在 Folia 服务端。委托 {@link SchedulerCompat} 统一实现，
+     * 避免本类直接引用 Folia API（保证纯 paper-api 即可编译）。
      */
     public static boolean isFolia() {
-        if (isFolia != null) {
-            return isFolia;
-        }
-        try {
-            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
-            isFolia = true;
-        } catch (ClassNotFoundException e) {
-            isFolia = false;
-        }
-        return isFolia;
+        return SchedulerCompat.isFolia();
     }
     
     /**
-     * 在正确的线程上执行任务 — 自动适配 Folia / Paper。
-     * 
-     * - Folia: 使用 RegionScheduler 在区块所在区域的主线程上执行
-     * - Paper/Spigot: 如果当前已在主线程则直接执行，否则通过 runTask 调度到主线程
-     * 
+     * 在正确的线程上执行任务 — 委托 {@link SchedulerCompat} 自动适配 Folia / Paper。
+     *
+     * <p>注意：传入的 task 若访问世界方块/实体，location 必须指向被访问的区块；
+     * 若 task 需要操作跨越多个 region 的方块，应改用按区块分组的调用（见 {@code MineSweeperGame}）。
+     *
      * @param location 用于确定 Folia 区域的 Location（Paper 上可为 null）
      * @param task 需要执行的 Runnable
      */
     void executeOnMainThread(Location location, Runnable task) {
-        if (isFolia()) {
-            // Folia: 必须通过区域调度器执行（1.20.1 API 中 execute 接受 Runnable）
-            if (location != null && location.isWorldLoaded()) {
-                getServer().getRegionScheduler().execute(this, location.getWorld(),
-                        location.getBlockX() >> 4, location.getBlockZ() >> 4,
-                        task);
-            } else {
-                getServer().getGlobalRegionScheduler().execute(this, task);
-            }
-        } else {
-            // Paper/Spigot: 主线程检查 + 必要时调度
-            if (org.bukkit.Bukkit.isPrimaryThread()) {
-                task.run();
-            } else {
-                getServer().getScheduler().runTask(this, task);
-            }
-        }
+        SchedulerCompat.runOnRegion(this, location, task);
     }
 
     @Override
     public void onEnable() {
-        // 预热 Folia 检测
-        isFolia();
-        
         // 注册事件监听器
         getServer().getPluginManager().registerEvents(new MineSweeperListener(this), this);
 
@@ -102,18 +72,10 @@ public final class MineSweeperPlugin extends JavaPlugin {
             for (String e : rr.errors) getLogger().severe("  - " + e);
         }
 
-        // 启动超时检查任务 (每20 ticks/1秒)
-        // 定时器本体可在任意线程运行，但世界操作通过 executeOnMainThread 保证在主线程执行
-        if (isFolia()) {
-            getServer().getGlobalRegionScheduler().runAtFixedRate(this, (task) -> {
-                tickGames();
-            }, 20L, 20L);
-        } else {
-            // Paper/Spigot: 直接使用同步定时器，回调已在主线程
-            getServer().getScheduler().runTaskTimer(this, () -> {
-                tickGames();
-            }, 20L, 20L);
-        }
+        // 启动超时检查任务（每 20 ticks / 1 秒）。
+        // 统一走 SchedulerCompat：Folia 下在全局区域线程回调（不访问具体世界/实体，
+        // 仅读游戏状态字段并转发世界操作到对应 region）；Paper 下在主线程回调。
+        SchedulerCompat.runOnGlobalAtFixedRate(this, this::tickGames, 20L, 20L);
     }
     
     /**

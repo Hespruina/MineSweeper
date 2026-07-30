@@ -7,43 +7,47 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.FluidCollisionMode;
+import top.zhrhello.mineSweeper.folia.SchedulerCompat;
 import top.zhrhello.mineSweeper.logic.GameContext;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class MineSweeperGame {
     private final MineSweeperPlugin plugin;
     private final Set<Location> platformBlocks;
+    // 游戏状态集合使用并发结构：tickGames（全局区域线程）与玩家区域线程可能并发读写
     private final Map<Location, Boolean> isMine;
     private final Map<Location, Integer> numbers;
     private final Set<Location> flaggedBlocks;
     private final Set<Location> revealedBlocks;
     private final Location startLocation;
-    private long lastActivityTime;
-    private boolean active;
-    private boolean waitingForExit;
+    // 状态字段均 volatile 或原子类：tickGames 在全局区域线程读取，游戏逻辑在区域线程写入
+    private volatile long lastActivityTime;
+    private volatile boolean active;
+    private volatile boolean waitingForExit;
     private final int mineCount;
-    private int exitCountdown = -1; // 退出倒计时（秒）
-    private boolean firstClick = true; // 标记是否为首次点击
-    private boolean autoFlagEnabled = false; // 自动标记开关
-    private int customMineCount; // 自定义雷数
-    private int difficulty = 1; // 难度等级 1=简单 2=中等 3=困难
-    private Player lastActor;    // 最近操作游戏的玩家（用于奖励上下文）
-    private Player creator;                 // 创建者（放置 TNT 的玩家）；需先点击"启动游戏"游戏才算开始
-    private boolean waitingForStart = true; // 等待创建者点击"启动游戏"；此状态下禁止翻格/插旗
-    private long waitingSince;              // 进入等待启动状态的时间戳（用于 15 秒超时解散）
+    private final AtomicInteger exitCountdown = new AtomicInteger(-1); // 退出倒计时（秒）
+    private volatile boolean firstClick = true; // 标记是否为首次点击
+    private volatile boolean autoFlagEnabled = false; // 自动标记开关
+    private volatile int customMineCount; // 自定义雷数
+    private volatile int difficulty = 1; // 难度等级 1=简单 2=中等 3=困难
+    private volatile Player lastActor;    // 最近操作游戏的玩家（用于奖励上下文）
+    private final Player creator;         // 创建者（放置 TNT 的玩家）；需先点击"启动游戏"游戏才算开始
+    private volatile boolean waitingForStart = true; // 等待创建者点击"启动游戏"；此状态下禁止翻格/插旗
+    private volatile long waitingSince;   // 进入等待启动状态的时间戳（用于 15 秒超时解散）
 
     public MineSweeperGame(MineSweeperPlugin plugin, Set<Location> platformBlocks, Location startLocation, Player creator) {
         this.plugin = plugin;
         this.platformBlocks = Collections.unmodifiableSet(new HashSet<>(platformBlocks));
         this.startLocation = startLocation.clone();
         this.creator = creator;
-        this.isMine = new HashMap<>();
-        this.numbers = new HashMap<>();
-        this.flaggedBlocks = new HashSet<>();
-        this.revealedBlocks = new HashSet<>();
+        this.isMine = new ConcurrentHashMap<>();
+        this.numbers = new ConcurrentHashMap<>();
+        this.flaggedBlocks = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        this.revealedBlocks = Collections.newSetFromMap(new ConcurrentHashMap<>());
         this.lastActivityTime = System.currentTimeMillis();
         this.active = true;
         this.waitingForExit = false;
@@ -66,9 +70,21 @@ public class MineSweeperGame {
         showStartTitle();
     }
 
+    // ===================== Folia/Paper 区域调度辅助 =====================
+
+    /** 在 loc 所属 region 线程执行 op：当前线程已拥有则同步执行，否则转发到对应 region。 */
+    private void onRegion(Location loc, Runnable op) {
+        SchedulerCompat.runOnRegionOwned(plugin, loc, op);
+    }
+
+    /** 设置 loc 处方块类型（自动路由到正确 region 线程，支持平台跨 region）。 */
+    private void setBlockType(Location loc, Material material) {
+        onRegion(loc, () -> loc.getBlock().setType(material));
+    }
+
     private void initializePlatform() {
         for (Location loc : platformBlocks) {
-            loc.getBlock().setType(Material.GRAY_CONCRETE);
+            setBlockType(loc, Material.GRAY_CONCRETE);
         }
     }
 
@@ -77,38 +93,43 @@ public class MineSweeperGame {
     private void clearLeftoverChests() {
         for (Location loc : platformBlocks) {
             Location up = loc.clone().add(0, 1, 0);
-            Block block = up.getBlock();
-            if (block.getType() != Material.CHEST) continue;
+            onRegion(up, () -> {
+                Block block = up.getBlock();
+                if (block.getType() != Material.CHEST) return;
 
-            Chest chest = (Chest) block.getState();
-            Location dropLoc = up.clone().add(0.5, 0.5, 0.5);
+                Chest chest = (Chest) block.getState();
+                Location dropLoc = up.clone().add(0.5, 0.5, 0.5);
 
-            // 掉落箱子本身
-            block.getWorld().dropItemNaturally(dropLoc, new ItemStack(Material.CHEST));
-            // 掉落箱内所有物品
-            for (ItemStack item : chest.getInventory().getContents()) {
-                if (item != null && item.getType() != Material.AIR) {
-                    block.getWorld().dropItemNaturally(dropLoc, item);
+                // 掉落箱子本身
+                block.getWorld().dropItemNaturally(dropLoc, new ItemStack(Material.CHEST));
+                // 掉落箱内所有物品
+                for (ItemStack item : chest.getInventory().getContents()) {
+                    if (item != null && item.getType() != Material.AIR) {
+                        block.getWorld().dropItemNaturally(dropLoc, item);
+                    }
                 }
-            }
-            // 清空并移除箱子方块
-            chest.getInventory().clear();
-            block.setType(Material.AIR);
+                // 清空并移除箱子方块
+                chest.getInventory().clear();
+                block.setType(Material.AIR);
+            });
         }
     }
 
     private void showStartTitle() {
+        final int mines = customMineCount;
         for (Location loc : platformBlocks) {
             Location upLoc = loc.clone().add(0, 1, 0);
-            Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
-            for (Entity entity : entities) {
-                if (entity instanceof Player) {
-                    Player player = (Player) entity;
-                    player.sendTitle(ChatColor.GOLD + "扫雷游戏", "雷数: " + customMineCount, 10, 40, 10);
-                    player.sendMessage(ChatColor.GREEN + "游戏提示: 左键翻开方块，右键插旗标记地雷");
-                    player.sendMessage(ChatColor.GREEN + "数字表示周围8个格子中地雷的数量");
+            onRegion(upLoc, () -> {
+                Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
+                for (Entity entity : entities) {
+                    if (entity instanceof Player) {
+                        Player player = (Player) entity;
+                        player.sendTitle(ChatColor.GOLD + "扫雷游戏", "雷数: " + mines, 10, 40, 10);
+                        player.sendMessage(ChatColor.GREEN + "游戏提示: 左键翻开方块，右键插旗标记地雷");
+                        player.sendMessage(ChatColor.GREEN + "数字表示周围8个格子中地雷的数量");
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -165,7 +186,7 @@ public class MineSweeperGame {
             lastActivityTime = System.currentTimeMillis();
             // 如果在退出倒计时阶段点击，则重置倒计时
             if (waitingForExit) {
-                exitCountdown = 10;
+                exitCountdown.set(10);
                 showExitCountdown(player);
             }
             return;
@@ -213,7 +234,7 @@ public class MineSweeperGame {
         if (isMine.getOrDefault(clickedLoc, false)) {
             revealAllMines();
             waitingForExit = true;
-            exitCountdown = 10; // 设置10秒退出倒计时
+            exitCountdown.set(10); // 设置10秒退出倒计时
             showExitCountdown(player);
             player.sendMessage(ChatColor.RED + "BOOM! 点击任意方块退出游戏");
             player.playSound(player.getLocation(), Sound.ENTITY_GENERIC_EXPLODE, 1.0f, 1.0f);
@@ -416,7 +437,7 @@ public class MineSweeperGame {
                         // 点击到雷
                         revealAllMines();
                         waitingForExit = true;
-                        exitCountdown = 10; // 设置10秒退出倒计时
+                        exitCountdown.set(10); // 设置10秒退出倒计时
                         showExitCountdown(player);
                         player.sendMessage(ChatColor.RED + "BOOM! 点击任意方块退出游戏");
                         return;
@@ -448,53 +469,37 @@ public class MineSweeperGame {
             case 8: material = Material.BLACK_CONCRETE; break;
             default: material = Material.WHITE_CONCRETE;
         }
-        loc.getBlock().setType(material);
+        setBlockType(loc, material);
     }
 
     private void revealAllMines() {
         for (Location loc : platformBlocks) {
             if (isMine.getOrDefault(loc, false)) {
-                loc.getBlock().setType(Material.TNT);
+                setBlockType(loc, Material.TNT);
             }
         }
     }
 
     // 临时显示地雷给特定玩家
     public void showMinesToPlayer(Player player, int durationSeconds) {
-        // 记录玩家原来位置的方块类型
-        Map<Location, Material> originalBlocks = new HashMap<>();
-        
+        // 记录原始方块类型（并发结构：设置与恢复可能在各自 region 线程执行）
+        Map<Location, Material> originalBlocks = new ConcurrentHashMap<>();
+        long delayTicks = durationSeconds * 20L;
+
         for (Location loc : platformBlocks) {
-            if (isMine.getOrDefault(loc, false)) {
+            if (!isMine.getOrDefault(loc, false)) continue;
+            // 设置为 TNT 并记录原类型（在 loc 所属 region 线程执行）
+            onRegion(loc, () -> {
                 originalBlocks.put(loc, loc.getBlock().getType());
                 loc.getBlock().setType(Material.TNT);
-            }
-        }
-        
-        // 延迟恢复原来的方块类型 — 使用统一的 Folia/Paper 检测和调度
-        if (!platformBlocks.isEmpty()) {
-            Location loc = platformBlocks.iterator().next();
-            if (MineSweeperPlugin.isFolia()) {
-                plugin.getServer().getRegionScheduler().runDelayed(plugin, loc, (scheduledTask) -> {
-                    for (Map.Entry<Location, Material> entry : originalBlocks.entrySet()) {
-                        Location blockLoc = entry.getKey();
-                        Material originalType = entry.getValue();
-                        if (blockLoc.getBlock().getType() == Material.TNT) {
-                            blockLoc.getBlock().setType(originalType);
-                        }
-                    }
-                }, durationSeconds * 20L);
-            } else {
-                plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-                    for (Map.Entry<Location, Material> entry : originalBlocks.entrySet()) {
-                        Location blockLoc = entry.getKey();
-                        Material originalType = entry.getValue();
-                        if (blockLoc.getBlock().getType() == Material.TNT) {
-                            blockLoc.getBlock().setType(originalType);
-                        }
-                    }
-                }, durationSeconds * 20L);
-            }
+            });
+            // 延迟恢复（每个方块在其所属 region 线程恢复，支持平台跨 region）
+            SchedulerCompat.runOnRegionDelayed(plugin, loc, () -> {
+                Material originalType = originalBlocks.get(loc);
+                if (originalType != null && loc.getBlock().getType() == Material.TNT) {
+                    loc.getBlock().setType(originalType);
+                }
+            }, delayTicks);
         }
     }
 
@@ -515,7 +520,7 @@ public class MineSweeperGame {
             lastActivityTime = System.currentTimeMillis();
             // 如果在退出倒计时阶段点击，则重置倒计时
             if (waitingForExit) {
-                exitCountdown = 10;
+                exitCountdown.set(10);
                 showExitCountdown(player);
             }
             return;
@@ -547,7 +552,7 @@ public class MineSweeperGame {
     private void handleEndGameScenario(Player player) {
         lastActivityTime = System.currentTimeMillis();
         if (waitingForExit) {
-            exitCountdown = 10;
+            exitCountdown.set(10);
             showExitCountdown(player);
             player.sendMessage(ChatColor.YELLOW + "游戏已结束，点击任意方块退出");
         }
@@ -565,15 +570,17 @@ public class MineSweeperGame {
 
         flaggedBlocks.add(loc);
         Location torchLoc = loc.clone().add(0, 1, 0);
-        torchLoc.getBlock().setType(Material.REDSTONE_TORCH);
+        setBlockType(torchLoc, Material.REDSTONE_TORCH);
     }
 
     private void removeFlag(Location loc) {
         if (flaggedBlocks.remove(loc)) {
             Location torchLoc = loc.clone().add(0, 1, 0);
-            if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
-                torchLoc.getBlock().setType(Material.AIR);
-            }
+            onRegion(torchLoc, () -> {
+                if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
+                    torchLoc.getBlock().setType(Material.AIR);
+                }
+            });
         }
     }
 
@@ -596,29 +603,22 @@ public class MineSweeperGame {
     }
 
     public void endGame(boolean success) {
-        // 防御性主线程检查：Paper/Spigot 上 World API 必须在主线程调用
-        if (!MineSweeperPlugin.isFolia() && !Bukkit.isPrimaryThread()) {
-            if (!platformBlocks.isEmpty()) {
-                Location loc = platformBlocks.iterator().next();
-                plugin.executeOnMainThread(loc, () -> endGame(success));
-            }
-            return;
-        }
-        
         if (!active) return;
         active = false;
         waitingForExit = false;
         plugin.removeGame(this);
 
-        // 还原所有方块
+        // 还原所有方块（按 region 路由，支持平台跨 region，且可从任意线程调用）
         for (Location loc : platformBlocks) {
-            loc.getBlock().setType(Material.GRAY_CONCRETE);
+            setBlockType(loc, Material.GRAY_CONCRETE);
         }
         for (Location loc : flaggedBlocks) {
             Location torchLoc = loc.clone().add(0, 1, 0);
-            if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
-                torchLoc.getBlock().setType(Material.AIR);
-            }
+            onRegion(torchLoc, () -> {
+                if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
+                    torchLoc.getBlock().setType(Material.AIR);
+                }
+            });
         }
         flaggedBlocks.clear();
         revealedBlocks.clear();
@@ -641,50 +641,38 @@ public class MineSweeperGame {
 
     // 显示退出倒计时给玩家
     private void showExitCountdown(Player player) {
-        if (exitCountdown > 0) {
-            player.sendTitle("", "游戏将在 " + exitCountdown + " 秒后自动退出", 0, 25, 5);
-        } else if (exitCountdown == 0) {
+        int cd = exitCountdown.get();
+        if (cd > 0) {
+            player.sendTitle("", "游戏将在 " + cd + " 秒后自动退出", 0, 25, 5);
+        } else if (cd == 0) {
             player.sendTitle("", "游戏退出", 0, 25, 5);
         }
     }
 
     // 向所有在平台方块上的玩家显示倒计时
     public void showCountdownToPlayers() {
-        // 防御性主线程检查：Paper/Spigot 上 World API 必须在主线程调用
-        // 若因调度错误等原因在异步线程执行，自动重定向到主线程，避免 AsyncCatcher 报错
-        if (!MineSweeperPlugin.isFolia() && !Bukkit.isPrimaryThread()) {
-            if (!platformBlocks.isEmpty()) {
-                Location loc = platformBlocks.iterator().next();
-                plugin.executeOnMainThread(loc, this::showCountdownToPlayers);
-            }
-            return;
-        }
-        
-        if (exitCountdown > 0 && waitingForExit) {
+        if (exitCountdown.get() > 0 && waitingForExit) {
             for (Location loc : platformBlocks) {
-                // 获取在平台方块上方的玩家
                 Location upLoc = loc.clone().add(0, 1, 0);
-                Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
-                for (Entity entity : entities) {
-                    if (entity instanceof Player) {
-                        Player player = (Player) entity;
-                        showExitCountdown(player);
+                onRegion(upLoc, () -> {
+                    Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
+                    for (Entity entity : entities) {
+                        if (entity instanceof Player) {
+                            showExitCountdown((Player) entity);
+                        }
                     }
-                }
+                });
             }
         }
     }
 
-    // 获取退出倒计时
     public int getExitCountdown() {
-        return exitCountdown;
+        return exitCountdown.get();
     }
 
     // 减少退出倒计时
     public void decrementExitCountdown() {
-        if (exitCountdown > 0) {
-            exitCountdown--;
-        }
+        exitCountdown.updateAndGet(v -> v > 0 ? v - 1 : v);
     }
 
     // 创建教学GUI
@@ -847,27 +835,21 @@ public class MineSweeperGame {
      * 不触发任何胜负奖励。通过插件调度在主线程执行。
      */
     public void timeoutCancel() {
-        // 防御性主线程检查：Paper/Spigot 上 World API 必须在主线程调用
-        if (!MineSweeperPlugin.isFolia() && !Bukkit.isPrimaryThread()) {
-            if (!platformBlocks.isEmpty()) {
-                Location loc = platformBlocks.iterator().next();
-                plugin.executeOnMainThread(loc, this::timeoutCancel);
-            }
-            return;
-        }
         if (!active) return;
         active = false;
         waitingForStart = false;
         plugin.removeGame(this);
 
         for (Location loc : platformBlocks) {
-            loc.getBlock().setType(Material.GRAY_CONCRETE);
+            setBlockType(loc, Material.GRAY_CONCRETE);
         }
         for (Location loc : flaggedBlocks) {
             Location torchLoc = loc.clone().add(0, 1, 0);
-            if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
-                torchLoc.getBlock().setType(Material.AIR);
-            }
+            onRegion(torchLoc, () -> {
+                if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
+                    torchLoc.getBlock().setType(Material.AIR);
+                }
+            });
         }
         flaggedBlocks.clear();
         revealedBlocks.clear();
@@ -879,12 +861,14 @@ public class MineSweeperGame {
     private void notifyPlayersOnPlatform(String message) {
         for (Location loc : platformBlocks) {
             Location upLoc = loc.clone().add(0, 1, 0);
-            Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
-            for (Entity entity : entities) {
-                if (entity instanceof Player) {
-                    ((Player) entity).sendMessage(message);
+            onRegion(upLoc, () -> {
+                Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
+                for (Entity entity : entities) {
+                    if (entity instanceof Player) {
+                        ((Player) entity).sendMessage(message);
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -912,50 +896,52 @@ public class MineSweeperGame {
      * - 否则 → "雷数: xxx"
      */
     public void updatePlayerActionBars() {
-        // 收集平台上方的所有玩家（去重）
-        Set<Player> playersOnPlatform = new HashSet<>();
+        final int mines = customMineCount;
         for (Location loc : platformBlocks) {
             Location upLoc = loc.clone().add(0, 1, 0);
-            Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
-            for (Entity entity : entities) {
-                if (entity instanceof Player) {
-                    playersOnPlatform.add((Player) entity);
-                }
-            }
-        }
-
-        for (Player player : playersOnPlatform) {
-            // 射线检测玩家视线指向的方块（5格内）
-            Block target = player.getTargetBlockExact(5, FluidCollisionMode.NEVER);
-            if (target != null) {
-                Location targetLoc = target.getLocation();
-
-                // 指向的是旗帜（红石火把在已标记方块上方）
-                if (target.getType() == Material.REDSTONE_TORCH) {
-                    Location below = targetLoc.clone().add(0, -1, 0);
-                    if (platformBlocks.contains(below) && flaggedBlocks.contains(below)) {
-                        player.sendActionBar(ChatColor.RED + "左键拆除旗帜" + ChatColor.GRAY + " | " + ChatColor.YELLOW + "雷数: " + customMineCount);
-                        continue;
+            onRegion(upLoc, () -> {
+                Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
+                for (Entity entity : entities) {
+                    if (entity instanceof Player) {
+                        updateActionBarFor((Player) entity, mines);
                     }
                 }
+            });
+        }
+    }
 
-                // 指向的是已翻开方块 → 显示数字
-                if (platformBlocks.contains(targetLoc) && revealedBlocks.contains(targetLoc)) {
-                    int number = numbers.getOrDefault(targetLoc, 0);
-                    ChatColor color = getNumberColor(number);
-                    player.sendActionBar(color + "此方块示数: " + number);
-                    continue;
-                }
+    /** 单个玩家的 ActionBar 更新（在玩家所在 region 线程调用，getTargetBlockExact 安全）。 */
+    private void updateActionBarFor(Player player, int mines) {
+        // 射线检测玩家视线指向的方块（5格内）
+        Block target = player.getTargetBlockExact(5, FluidCollisionMode.NEVER);
+        if (target != null) {
+            Location targetLoc = target.getLocation();
 
-                // 指向的是未翻开方块 → 提示插旗
-                if (platformBlocks.contains(targetLoc) && !revealedBlocks.contains(targetLoc)) {
-                    player.sendActionBar(ChatColor.GREEN + "手持任意物品右键插旗" + ChatColor.GRAY + " | " + ChatColor.YELLOW + "雷数: " + customMineCount);
-                    continue;
+            // 指向的是旗帜（红石火把在已标记方块上方）
+            if (target.getType() == Material.REDSTONE_TORCH) {
+                Location below = targetLoc.clone().add(0, -1, 0);
+                if (platformBlocks.contains(below) && flaggedBlocks.contains(below)) {
+                    player.sendActionBar(ChatColor.RED + "左键拆除旗帜" + ChatColor.GRAY + " | " + ChatColor.YELLOW + "雷数: " + mines);
+                    return;
                 }
             }
 
-            // 默认：视线未指向游戏内方块
-            player.sendActionBar(ChatColor.YELLOW + "雷数: " + customMineCount);
+            // 指向的是已翻开方块 → 显示数字
+            if (platformBlocks.contains(targetLoc) && revealedBlocks.contains(targetLoc)) {
+                int number = numbers.getOrDefault(targetLoc, 0);
+                ChatColor color = getNumberColor(number);
+                player.sendActionBar(color + "此方块示数: " + number);
+                return;
+            }
+
+            // 指向的是未翻开方块 → 提示插旗
+            if (platformBlocks.contains(targetLoc) && !revealedBlocks.contains(targetLoc)) {
+                player.sendActionBar(ChatColor.GREEN + "手持任意物品右键插旗" + ChatColor.GRAY + " | " + ChatColor.YELLOW + "雷数: " + mines);
+                return;
+            }
         }
+
+        // 默认：视线未指向游戏内方块
+        player.sendActionBar(ChatColor.YELLOW + "雷数: " + mines);
     }
 }
