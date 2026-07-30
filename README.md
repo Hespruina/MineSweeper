@@ -264,4 +264,16 @@ MineSweeper/
 
 ---
 
+## 许可
+
+本项目版权归作者所有。如需使用、修改或分发，请与作者联系确认许可方式。
+
+## 赞助
+
+如果这个插件对你有帮助，欢迎通过爱发电支持作者，你的支持是持续维护的动力：
+
+- **爱发电（ifdian.net）**：https://ifdian.net/a/zhrhello
+
+---
+
 > 包名：`top.zhrhello.mineSweeper` · 插件名：`MineSweeper` · 适配 Minecraft 1.20.1
