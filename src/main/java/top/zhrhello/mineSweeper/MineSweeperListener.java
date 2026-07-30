@@ -4,7 +4,9 @@ import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.TNTPrimed;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
@@ -12,6 +14,7 @@ import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
+import org.bukkit.event.entity.EntitySpawnEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -38,14 +41,28 @@ public class MineSweeperListener implements Listener {
     public void onTNTPlace(BlockPlaceEvent event) {
         if (event.getBlock().getType() != Material.TNT) return;
 
+        // 蹲下放置 TNT 不触发游戏：允许玩家正常用 TNT 爆破自己的平台
+        if (event.getPlayer().isSneaking()) return;
+
         Block below = event.getBlock().getRelative(BlockFace.DOWN);
         if (below.getType() != Material.GRAY_CONCRETE) return;
 
         // 检测平台连通区域
         Set<Location> platform = detectPlatform(below.getLocation());
-        if (platform.size() < 25) {
-            event.getPlayer().sendMessage(ChatColor.RED + "平台太小！至少需要5x5区域");
+
+        // 验证平台包含至少 5x5 的完整矩形区域（防止直线作弊）
+        if (!hasMinimumArea(platform)) {
+            event.getPlayer().sendMessage(ChatColor.RED + "平台必须包含完整的5x5矩形区域，不能是一条直线！");
             return;
+        }
+
+        // 检查平台方块是否已被其他进行中的游戏占用
+        for (Location loc : platform) {
+            MineSweeperGame existing = plugin.getGameAt(loc);
+            if (existing != null && existing.isActive()) {
+                event.getPlayer().sendMessage(ChatColor.RED + "该平台部分方块已被其他进行中的游戏占用！");
+                return;
+            }
         }
 
         // 有效平台：收取TNT
@@ -56,7 +73,8 @@ public class MineSweeperListener implements Listener {
         MineSweeperGame game = new MineSweeperGame(
                 plugin,
                 platform,
-                below.getLocation()
+                below.getLocation(),
+                event.getPlayer()
         );
         plugin.addGame(game);
         
@@ -65,6 +83,27 @@ public class MineSweeperListener implements Listener {
         playerGames.put(event.getPlayer().getUniqueId(), game);
 
         event.getPlayer().sendMessage(ChatColor.GREEN + "扫雷游戏已准备！请配置选项并启动游戏");
+    }
+
+    // 防止玩家在游戏平台上放置任何方块（TNT 由 onTNTPlace 专门处理，用于启动游戏）
+    @EventHandler
+    public void onBlockPlace(BlockPlaceEvent event) {
+        Block block = event.getBlock();
+        // TNT 交给 onTNTPlace 处理，不要拦截（否则无法启动游戏）
+        if (block.getType() == Material.TNT) return;
+
+        Location loc = block.getLocation();
+        // 检查放置位置本身，或放置位置下方一层是否为游戏平台方块。
+        // 这样无论玩家是对着平台方块右键，还是对着旁边的墙/方块右键、
+        // 让方块落在平台表面（格子上方一层），都会被拦截。
+        MineSweeperGame game = plugin.getGameAt(loc);
+        if (game == null) {
+            game = plugin.getGameAt(loc.clone().add(0, -1, 0));
+        }
+        if (game != null && game.isActive()) {
+            event.setCancelled(true);
+            event.getPlayer().sendMessage(ChatColor.RED + "不能在此游戏平台上放置方块！");
+        }
     }
 
     // 平台检测 (BFS连通区域)
@@ -88,6 +127,53 @@ public class MineSweeperListener implements Listener {
             }
         }
         return platform;
+    }
+
+    /**
+     * 检查平台是否包含至少一个完整的 5x5 矩形区域。
+     * 防止玩家用直线（25 块一字排开）作弊通过大小检查。
+     */
+    private boolean hasMinimumArea(Set<Location> platform) {
+        if (platform.size() < 25) return false;
+
+        // 计算包围盒
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        int y = 0;
+
+        for (Location loc : platform) {
+            int x = loc.getBlockX();
+            int z = loc.getBlockZ();
+            y = loc.getBlockY();
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minZ = Math.min(minZ, z);
+            maxZ = Math.max(maxZ, z);
+        }
+
+        // 包围盒本身都不够 5x5，不可能存在
+        if (maxX - minX + 1 < 5 || maxZ - minZ + 1 < 5) return false;
+
+        World world = platform.iterator().next().getWorld();
+
+        // 滑动窗口：扫描是否存在一个 5x5 子区域，其中 25 个方块全部在 platform 中
+        for (int sx = minX; sx <= maxX - 4; sx++) {
+            for (int sz = minZ; sz <= maxZ - 4; sz++) {
+                boolean allPresent = true;
+                for (int dx = 0; dx < 5; dx++) {
+                    for (int dz = 0; dz < 5; dz++) {
+                        Location check = new Location(world, sx + dx, y, sz + dz);
+                        if (!platform.contains(check)) {
+                            allPresent = false;
+                            break;
+                        }
+                    }
+                    if (!allPresent) break;
+                }
+                if (allPresent) return true;
+            }
+        }
+        return false;
     }
 
     // 左/右键点击处理
@@ -166,19 +252,52 @@ public class MineSweeperListener implements Listener {
         }
     }
     
+    // 处理引爆状态的 TNT：只要位于游戏平台上，直接移除（禁止在平台爆炸）
+    @EventHandler
+    public void onTNTPrimedSpawn(EntitySpawnEvent event) {
+        if (!(event.getEntity() instanceof TNTPrimed)) return;
+
+        Location loc = event.getEntity().getLocation();
+        // 检查 TNT 实体自身所在位置，或其下方一层是否为游戏平台方块
+        MineSweeperGame game = plugin.getGameAt(loc);
+        if (game == null) {
+            game = plugin.getGameAt(loc.clone().add(0, -1, 0));
+        }
+        if (game != null && game.isActive()) {
+            event.getEntity().remove();
+        }
+    }
+
     // 防止TNT爆炸破坏游戏区域
     @EventHandler
     public void onEntityExplode(EntityExplodeEvent event) {
+        // 双保险：若爆炸中心位于游戏平台上，整体取消该次爆炸
+        // （主要逻辑在 onTNTPrimedSpawn 中已移除引爆中的 TNT，这里兜底防止漏网）
+        Location center = event.getLocation();
+        MineSweeperGame game = plugin.getGameAt(center);
+        if (game == null) {
+            game = plugin.getGameAt(center.clone().add(0, -1, 0));
+        }
+        if (game != null && game.isActive()) {
+            event.setCancelled(true);
+            return;
+        }
+
+        // 平台外的爆炸：移除所有属于游戏平台的方块。
+        // 保护范围 = 平台方块本身（格子层）+ 其正上方一层（红石火把、奖励箱子等），
+        // 无论爆炸中心在不在平台上，平台和火把都不会被破坏。
         List<Block> blocksToRemove = new ArrayList<>();
         for (Block block : event.blockList()) {
             Location loc = block.getLocation();
-            MineSweeperGame game = plugin.getGameAt(loc);
-            if (game != null && game.isActive()) {
-                // 取消对该方块的破坏
+            MineSweeperGame g = plugin.getGameAt(loc);
+            if (g == null) {
+                // 检查是否位于平台方块正上方一层（火把/箱子层）
+                g = plugin.getGameAt(loc.clone().add(0, -1, 0));
+            }
+            if (g != null && g.isActive()) {
                 blocksToRemove.add(block);
             }
         }
-        // 移除所有游戏区域内的方块
         event.blockList().removeAll(blocksToRemove);
     }
     
@@ -264,9 +383,33 @@ public class MineSweeperListener implements Listener {
                     return;
                 }
                 
+                // 处理取消游戏
+                if (slot == 24) {
+                    // 只有创建者才能取消游戏
+                    if (game.getCreator() != null && !game.getCreator().equals(player)) {
+                        player.sendMessage(ChatColor.RED + "只有创建者可以取消游戏");
+                        player.closeInventory();
+                        playerGames.remove(player.getUniqueId());
+                        return;
+                    }
+                    player.closeInventory();
+                    game.timeoutCancel();
+                    playerGames.remove(player.getUniqueId());
+                    player.sendMessage(ChatColor.RED + "游戏已取消");
+                    return;
+                }
+
                 // 处理启动游戏
                 if (slot == 26) {
+                    // 只有创建者才能启动游戏（理论上 GUI 仅对创建者开放，这里再次校验）
+                    if (game.getCreator() != null && !game.getCreator().equals(player)) {
+                        player.sendMessage(ChatColor.RED + "只有创建者可以启动游戏");
+                        player.closeInventory();
+                        playerGames.remove(player.getUniqueId());
+                        return;
+                    }
                     player.closeInventory();
+                    game.startGame();
                     player.sendMessage(ChatColor.GREEN + "游戏已启动！左键揭示，右键插旗");
                     player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.0f, 1.0f);
                     // 移除玩家与游戏的关联，因为游戏已经启动
@@ -304,6 +447,12 @@ public class MineSweeperListener implements Listener {
     // 玩家退出服务器：无论其 GUI 是否关闭，都清理关联，防止内存泄漏。
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
+        // 若创建者在"等待启动"阶段退出，立即解散游戏，避免平台被长期占用
+        MineSweeperGame game = playerGames.get(event.getPlayer().getUniqueId());
+        if (game != null && game.isWaitingForStart() && game.getCreator() != null
+                && game.getCreator().equals(event.getPlayer())) {
+            game.timeoutCancel();
+        }
         playerGames.remove(event.getPlayer().getUniqueId());
     }
 

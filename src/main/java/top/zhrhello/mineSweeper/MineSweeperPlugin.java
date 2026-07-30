@@ -93,8 +93,8 @@ public final class MineSweeperPlugin extends JavaPlugin {
         this.rewardManager = new RewardManager(this, configManager, logicEngine);
         ConfigManager.ReloadResult rr = configManager.reload();
         if (rr.success) {
-            getLogger().info("[MineSweeper] 配置加载成功：函数 " + rr.functionCount + " 个，动作 "
-                    + rr.actionCount + " 个，持久化条目 " + rr.persistenceCount + " 个"
+            getLogger().info("[MineSweeper] 配置加载成功：步骤 " + rr.stepCount + " 个，模块 "
+                    + rr.moduleCount + " 个，动作 " + rr.actionCount + " 个，持久化条目 " + rr.persistenceCount + " 个"
                     + (rr.warnings.isEmpty() ? "" : "（警告 " + rr.warnings.size() + " 条）"));
             for (String w : rr.warnings) getLogger().warning("[MineSweeper] 配置警告: " + w);
         } else {
@@ -124,8 +124,19 @@ public final class MineSweeperPlugin extends JavaPlugin {
     private void tickGames() {
         long currentTime = System.currentTimeMillis();
         for (MineSweeperGame game : new CopyOnWriteArrayList<>(activeGames)) {
-            // 检查无操作超时（60秒）
-            if (game.isActive() && !game.isWaitingForExit() && (currentTime - game.getLastActivityTime() > 60_000)) {
+            // 等待创建者"启动游戏"超时（15秒）：直接解散，避免无人开局却长期占用平台
+            if (game.isActive() && game.isWaitingForStart() && (currentTime - game.getWaitingSince() > 15_000)) {
+                if (!game.getPlatformBlocks().isEmpty()) {
+                    Location loc = game.getPlatformBlocks().iterator().next();
+                    executeOnMainThread(loc, () -> game.timeoutCancel());
+                } else {
+                    game.timeoutCancel();
+                }
+                continue;
+            }
+            // 检查无操作超时（60秒）；等待启动中的游戏不触发（由上面的 15 秒超时处理）
+            if (game.isActive() && !game.isWaitingForExit() && !game.isWaitingForStart()
+                    && (currentTime - game.getLastActivityTime() > 60_000)) {
                 if (!game.getPlatformBlocks().isEmpty()) {
                     Location loc = game.getPlatformBlocks().iterator().next();
                     executeOnMainThread(loc, () -> game.endGame(false));
@@ -167,7 +178,8 @@ public final class MineSweeperPlugin extends JavaPlugin {
                 ConfigManager.ReloadResult rr = configManager.reload();
                 if (rr.success) {
                     sender.sendMessage(ChatColor.GREEN + "配置热重载成功！");
-                    sender.sendMessage(ChatColor.YELLOW + "函数: " + rr.functionCount
+                    sender.sendMessage(ChatColor.YELLOW + "步骤: " + rr.stepCount
+                            + " | 模块: " + rr.moduleCount
                             + " | 动作: " + rr.actionCount + " | 持久化条目: " + rr.persistenceCount);
                     if (!rr.warnings.isEmpty()) {
                         sender.sendMessage(ChatColor.GOLD + "警告 " + rr.warnings.size() + " 条：");

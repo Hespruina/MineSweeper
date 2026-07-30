@@ -31,11 +31,15 @@ public class MineSweeperGame {
     private int customMineCount; // 自定义雷数
     private int difficulty = 1; // 难度等级 1=简单 2=中等 3=困难
     private Player lastActor;    // 最近操作游戏的玩家（用于奖励上下文）
+    private Player creator;                 // 创建者（放置 TNT 的玩家）；需先点击"启动游戏"游戏才算开始
+    private boolean waitingForStart = true; // 等待创建者点击"启动游戏"；此状态下禁止翻格/插旗
+    private long waitingSince;              // 进入等待启动状态的时间戳（用于 15 秒超时解散）
 
-    public MineSweeperGame(MineSweeperPlugin plugin, Set<Location> platformBlocks, Location startLocation) {
+    public MineSweeperGame(MineSweeperPlugin plugin, Set<Location> platformBlocks, Location startLocation, Player creator) {
         this.plugin = plugin;
         this.platformBlocks = Collections.unmodifiableSet(new HashSet<>(platformBlocks));
         this.startLocation = startLocation.clone();
+        this.creator = creator;
         this.isMine = new HashMap<>();
         this.numbers = new HashMap<>();
         this.flaggedBlocks = new HashSet<>();
@@ -43,11 +47,17 @@ public class MineSweeperGame {
         this.lastActivityTime = System.currentTimeMillis();
         this.active = true;
         this.waitingForExit = false;
+        this.waitingForStart = true;
+        this.waitingSince = System.currentTimeMillis();
 
         // 计算雷数 (15% of platform size, min 1)
         int totalBlocks = platformBlocks.size();
         this.mineCount = Math.max(1, (int) (totalBlocks * 0.15));
         this.customMineCount = this.mineCount;
+
+        // 新一局开始时，先把上一局遗留的奖励箱子破坏并掉落其内容与箱子本身，
+        // 解决玩家有时不挖箱子、导致奖励丢失的问题
+        clearLeftoverChests();
 
         // 初始化平台为灰色混凝土
         initializePlatform();
@@ -59,6 +69,31 @@ public class MineSweeperGame {
     private void initializePlatform() {
         for (Location loc : platformBlocks) {
             loc.getBlock().setType(Material.GRAY_CONCRETE);
+        }
+    }
+
+    // 新一局开始时清理上一局遗留的奖励箱子：将其与箱内物品全部变为掉落物。
+    // 这样即便玩家上一局没有挖掉箱子，奖励也不会丢——新游戏一开局就掉在地上可拾取。
+    private void clearLeftoverChests() {
+        for (Location loc : platformBlocks) {
+            Location up = loc.clone().add(0, 1, 0);
+            Block block = up.getBlock();
+            if (block.getType() != Material.CHEST) continue;
+
+            Chest chest = (Chest) block.getState();
+            Location dropLoc = up.clone().add(0.5, 0.5, 0.5);
+
+            // 掉落箱子本身
+            block.getWorld().dropItemNaturally(dropLoc, new ItemStack(Material.CHEST));
+            // 掉落箱内所有物品
+            for (ItemStack item : chest.getInventory().getContents()) {
+                if (item != null && item.getType() != Material.AIR) {
+                    block.getWorld().dropItemNaturally(dropLoc, item);
+                }
+            }
+            // 清空并移除箱子方块
+            chest.getInventory().clear();
+            block.setType(Material.AIR);
         }
     }
 
@@ -119,7 +154,13 @@ public class MineSweeperGame {
             return;
         }
         this.lastActor = player;
-        
+
+        // 等待创建者点击"启动游戏"期间，禁止翻格，提示玩家等待
+        if (waitingForStart) {
+            player.sendMessage(ChatColor.YELLOW + "请等待游戏开始");
+            return;
+        }
+
         if (!active || waitingForExit) {
             lastActivityTime = System.currentTimeMillis();
             // 如果在退出倒计时阶段点击，则重置倒计时
@@ -464,6 +505,12 @@ public class MineSweeperGame {
         }
         this.lastActor = player;
 
+        // 等待创建者点击"启动游戏"期间，禁止插旗，提示玩家等待
+        if (waitingForStart) {
+            player.sendMessage(ChatColor.YELLOW + "请等待游戏开始");
+            return;
+        }
+
         if (!active || waitingForExit) {
             lastActivityTime = System.currentTimeMillis();
             // 如果在退出倒计时阶段点击，则重置倒计时
@@ -577,7 +624,9 @@ public class MineSweeperGame {
         revealedBlocks.clear();
 
         // 触发可编程奖励系统（具体行为由 config.yml 中 rewards.win / rewards.lose 决定）
-        GameContext rewardContext = new GameContext(lastActor, difficulty, platformBlocks.size(),
+        // 优先使用 lastActor（最近操作的玩家），若为 null 则回退到 creator（创建者）
+        Player ctxPlayer = lastActor != null ? lastActor : creator;
+        GameContext rewardContext = new GameContext(ctxPlayer, difficulty, platformBlocks.size(),
                 customMineCount, autoFlagEnabled, platformBlocks);
         if (success) {
             plugin.getRewardManager().executeFlow("win", rewardContext);
@@ -690,6 +739,11 @@ public class MineSweeperGame {
                 "平台大小: " + platformSize,
                 "点击选择困难难度");
 
+        // 取消游戏按钮
+        addItem(gui, 24, Material.BARRIER, "取消游戏",
+                "点击取消本次游戏发起",
+                "平台将被还原为灰色混凝土");
+
         // 启动游戏按钮 - 显示奖励预览
         addItem(gui, 26, Material.TNT, "启动游戏", 
                 "难度: " + getDifficultyColor() + getDifficultyName(),
@@ -777,6 +831,62 @@ public class MineSweeperGame {
     public boolean isWaitingForExit() { return waitingForExit; }
     public long getLastActivityTime() { return lastActivityTime; }
     public Set<Location> getPlatformBlocks() { return platformBlocks; }
+    public boolean isWaitingForStart() { return waitingForStart; }
+    public long getWaitingSince() { return waitingSince; }
+    public Player getCreator() { return creator; }
+
+    // 创建者点击"启动游戏"：结束等待状态，游戏正式开始
+    public void startGame() {
+        this.waitingForStart = false;
+        this.lastActivityTime = System.currentTimeMillis();
+        notifyPlayersOnPlatform(ChatColor.GREEN + "游戏已开始！左键揭示，右键插旗");
+    }
+
+    /**
+     * 创建者超时未启动游戏的兜底处理：直接解散游戏（还原平台、移除游戏），
+     * 不触发任何胜负奖励。通过插件调度在主线程执行。
+     */
+    public void timeoutCancel() {
+        // 防御性主线程检查：Paper/Spigot 上 World API 必须在主线程调用
+        if (!MineSweeperPlugin.isFolia() && !Bukkit.isPrimaryThread()) {
+            if (!platformBlocks.isEmpty()) {
+                Location loc = platformBlocks.iterator().next();
+                plugin.executeOnMainThread(loc, this::timeoutCancel);
+            }
+            return;
+        }
+        if (!active) return;
+        active = false;
+        waitingForStart = false;
+        plugin.removeGame(this);
+
+        for (Location loc : platformBlocks) {
+            loc.getBlock().setType(Material.GRAY_CONCRETE);
+        }
+        for (Location loc : flaggedBlocks) {
+            Location torchLoc = loc.clone().add(0, 1, 0);
+            if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
+                torchLoc.getBlock().setType(Material.AIR);
+            }
+        }
+        flaggedBlocks.clear();
+        revealedBlocks.clear();
+
+        notifyPlayersOnPlatform(ChatColor.RED + "创建者超时未启动游戏，本局已解散");
+    }
+
+    // 向平台上所有玩家发送消息
+    private void notifyPlayersOnPlatform(String message) {
+        for (Location loc : platformBlocks) {
+            Location upLoc = loc.clone().add(0, 1, 0);
+            Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
+            for (Entity entity : entities) {
+                if (entity instanceof Player) {
+                    ((Player) entity).sendMessage(message);
+                }
+            }
+        }
+    }
 
     // 数字 → ChatColor 映射（与 setNumberBlock 的混凝土颜色一一对应）
     private ChatColor getNumberColor(int number) {
