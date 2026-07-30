@@ -3,6 +3,7 @@ package top.zhrhello.mineSweeper.folia;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
 import org.bukkit.plugin.Plugin;
 
@@ -61,6 +62,11 @@ public final class SchedulerCompat {
 
     private static Method mWorldIsOwnedLoc;
 
+    // 命令调度反射缓存（Folia 上绕过 ensureGlobalTickThread 检查）
+    private static Method mGetCommandMap;
+    private static Method mCmdMapDispatch;
+    private static boolean cmdDispatchAvailable;
+
     private SchedulerCompat() {
     }
 
@@ -116,6 +122,24 @@ public final class SchedulerCompat {
                 try {
                     Bukkit.getLogger().warning("[SchedulerCompat] World.isOwnedByCurrentRegion(Location) 方法不存在，" +
                             "当前服务端可能为 Luminol 等 Folia 分支，isOwnedByCurrentRegion 将始终返回 false");
+                } catch (Throwable ignored) {
+                }
+            }
+
+            // 命令调度反射：Folia 上 dispatchCommand 必须在全局 tick 线程，但
+            // GlobalRegionScheduler 线程池并非 tick 线程，因此绕过 ensureGlobalTickThread
+            // 直接走 CraftServer.getCommandMap().dispatch()。
+            try {
+                Class<?> craftServerCls = Class.forName("org.bukkit.craftbukkit.CraftServer");
+                mGetCommandMap = craftServerCls.getMethod("getCommandMap");
+                Class<?> cmdMapCls = Class.forName("org.bukkit.command.SimpleCommandMap");
+                mCmdMapDispatch = cmdMapCls.getMethod("dispatch", CommandSender.class, String.class);
+                cmdDispatchAvailable = true;
+            } catch (Throwable t) {
+                cmdDispatchAvailable = false;
+                try {
+                    Bukkit.getLogger().warning("[SchedulerCompat] 命令调度反射初始化失败，" +
+                            "Folia 上 console_command / player_command 将回退 runOnGlobal: " + t.getMessage());
                 } catch (Throwable ignored) {
                 }
             }
@@ -357,6 +381,51 @@ public final class SchedulerCompat {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    // ===================== 命令调度（线程安全命令分发） =====================
+
+    /**
+     * 线程安全地调度命令。
+     *
+     * <p>Paper（非 Folia）：在主线程执行 {@link Bukkit#dispatchCommand}。
+     * <p>Folia：绕过 {@code ensureGlobalTickThread} 检查，直接通过
+     * {@code CraftServer.getCommandMap().dispatch()} 执行命令。
+     * 调用者须确保自身已在正确的 region 线程（例如玩家数据/世界访问受 Folia 保护）。
+     *
+     * @param plugin 插件实例
+     * @param sender 命令发送者（ConsoleCommandSender 或 Player）
+     * @param command 完整命令字符串
+     */
+    public static void dispatchCommand(Plugin plugin, CommandSender sender, String command) {
+        if (!isFolia()) {
+            runOnMain(plugin, () -> Bukkit.dispatchCommand(sender, command));
+            return;
+        }
+        // Folia 上直接走 CraftServer.getCommandMap().dispatch()，
+        // 避免 GlobalRegionScheduler 线程不是全局 tick 线程导致的 IllegalStateException。
+        ensureFolia();
+        if (cmdDispatchAvailable) {
+            try {
+                Object cmdMap = mGetCommandMap.invoke(Bukkit.getServer());
+                mCmdMapDispatch.invoke(cmdMap, sender, command);
+                return;
+            } catch (Throwable t) {
+                try {
+                    plugin.getLogger().warning("[SchedulerCompat] 命令调度反射失败，回退 runOnGlobal: " + t.getMessage());
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        // 回退（可能仍会因线程检查抛异常，但至少不会静默丢失命令）
+        runOnGlobal(plugin, () -> {
+            try {
+                Bukkit.dispatchCommand(sender, command);
+            } catch (Throwable t) {
+                plugin.getLogger().log(Level.WARNING,
+                        "[SchedulerCompat] dispatchCommand 回退执行异常: " + command, t);
+            }
+        });
     }
 
     // ===================== 内部工具 =====================

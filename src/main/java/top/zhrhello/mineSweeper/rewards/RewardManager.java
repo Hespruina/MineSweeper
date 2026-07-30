@@ -134,13 +134,13 @@ public class RewardManager {
         switch (action.type) {
             case "console_command": {
                 String cmd = substitute(str(action.params.get("command")), ac);
-                Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+                SchedulerCompat.dispatchCommand(plugin, Bukkit.getConsoleSender(), cmd);
                 break;
             }
             case "player_command": {
                 String cmd = substitute(str(action.params.get("command")), ac);
                 if (player != null) {
-                    Bukkit.dispatchCommand(player, cmd);
+                    SchedulerCompat.dispatchCommand(plugin, player, cmd);
                 } else {
                     plugin.getLogger().warning("[Reward] player_command 缺少玩家上下文，已跳过");
                 }
