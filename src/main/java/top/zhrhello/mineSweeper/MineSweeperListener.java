@@ -22,7 +22,6 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import top.zhrhello.mineSweeper.folia.SchedulerCompat;
 
 public class MineSweeperListener implements Listener {
     private final MineSweeperPlugin plugin;
@@ -118,13 +117,26 @@ public class MineSweeperListener implements Listener {
             Location loc = queue.poll();
             for (BlockFace face : Arrays.asList(BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST)) {
                 Location next = loc.clone().add(face.getModX(), face.getModY(), face.getModZ());
-                if (next.getWorld().equals(loc.getWorld()) &&
-                        next.getBlockY() == loc.getBlockY() &&
-                        // Folia: 仅检测当前线程拥有的方块（玩家所在 region），跨 region 方块跳过以防崩溃；
-                        // Paper: isOwnedByCurrentRegion 恒等于主线程判断，事件线程中为 true，不影响检测。
-                        SchedulerCompat.isOwnedByCurrentRegion(next) &&
-                        next.getBlock().getType() == Material.GRAY_CONCRETE &&
-                        !platform.contains(next)) {
+                if (!next.getWorld().equals(loc.getWorld()) || next.getBlockY() != loc.getBlockY()) {
+                    continue;
+                }
+                if (platform.contains(next)) {
+                    continue;
+                }
+                // 注意：这里不能再用 isOwnedByCurrentRegion 做遍历门控。
+                // 原因：Luminol 等 Folia 分支缺少 World.isOwnedByCurrentRegion(Location) 方法，
+                //   isOwnedByCurrentRegion 会恒返回 false，导致 BFS 被截断、platform 只剩起始方块，
+                //   进而误报"平台必须包含 5x5 矩形区域"（即便平台实际是 6x6）。
+                //   标准 Folia 上若平台跨 region 边界，同样会被截断。
+                // 平台由玩家自己搭建、玩家就在旁边，chunk 必然已加载；对已加载 chunk 的 getType()
+                // 只读访问在 Folia 上是安全的。用 try-catch 兜底，仅在 chunk 未加载等极端情况跳过该方块。
+                Material type;
+                try {
+                    type = next.getBlock().getType();
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (type == Material.GRAY_CONCRETE) {
                     platform.add(next.clone());
                     queue.add(next);
                 }

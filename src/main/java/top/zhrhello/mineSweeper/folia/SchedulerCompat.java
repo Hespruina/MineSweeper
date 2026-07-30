@@ -32,7 +32,7 @@ import java.util.logging.Level;
  *       仅用于纯逻辑/计时/转发（如超时检测读状态字段后再转发）。</li>
  *   <li>{@link #runAsyncDelayed}：异步线程，仅用于计时后再转发，<b>不可直接访问世界/实体</b>。</li>
  *   <li>{@link #isOwnedByCurrentRegion(Location)}：判断当前线程是否拥有该位置，
- *       用于遍历平台时“同 region 直接执行、跨 region 转发”的优化与正确性。</li>
+ *       用于遍历平台时"同 region 直接执行、跨 region 转发"的优化与正确性。</li>
  * </ul>
  */
 public final class SchedulerCompat {
@@ -108,7 +108,17 @@ public final class SchedulerCompat {
             mEntityRun = entitySchCls.getMethod("run", Plugin.class, Consumer.class, Runnable.class);
             mEntityRunDelayed = entitySchCls.getMethod("runDelayed", Plugin.class, Consumer.class, Runnable.class, long.class);
 
-            mWorldIsOwnedLoc = World.class.getMethod("isOwnedByCurrentRegion", Location.class);
+            // 兼容 Luminol 等 Folia 分支：isOwnedByCurrentRegion 方法可能不存在
+            try {
+                mWorldIsOwnedLoc = World.class.getMethod("isOwnedByCurrentRegion", Location.class);
+            } catch (NoSuchMethodException e) {
+                mWorldIsOwnedLoc = null;
+                try {
+                    Bukkit.getLogger().warning("[SchedulerCompat] World.isOwnedByCurrentRegion(Location) 方法不存在，" +
+                            "当前服务端可能为 Luminol 等 Folia 分支，isOwnedByCurrentRegion 将始终返回 false");
+                } catch (Throwable ignored) {
+                }
+            }
 
             initialized = true;
         } catch (Throwable t) {
@@ -156,7 +166,7 @@ public final class SchedulerCompat {
 
     /**
      * 若当前线程已拥有 loc（Folia）或已为主线程（Paper），则同步执行 task；
-     * 否则转发到 loc 所属 region 线程执行。适合遍历一批位置时“同 region 直接执行、跨 region 转发”。
+     * 否则转发到 loc 所属 region 线程执行。适合遍历一批位置时"同 region 直接执行、跨 region 转发"。
      */
     public static void runOnRegionOwned(Plugin plugin, Location loc, Runnable task) {
         if (!isFolia()) {
@@ -325,12 +335,20 @@ public final class SchedulerCompat {
 
     // ===================== 归属判断 =====================
 
-    /** 当前线程是否拥有 loc（Folia）；是否为主线程（Paper）。 */
+    /** 
+     * 当前线程是否拥有 loc（Folia）；是否为主线程（Paper）。
+     * <p>注意：在 Luminol 等部分 Folia 分支上，由于缺少 isOwnedByCurrentRegion 方法，
+     * 此方法将始终返回 false，此时建议使用 {@link #runOnRegion} 代替 {@link #runOnRegionOwned}。
+     */
     public static boolean isOwnedByCurrentRegion(Location loc) {
         if (!isFolia()) {
             return Bukkit.isPrimaryThread();
         }
         ensureFolia();
+        // 兼容 Luminol 等缺失 isOwnedByCurrentRegion 方法的 Folia 分支
+        if (mWorldIsOwnedLoc == null) {
+            return false;
+        }
         try {
             if (loc == null || loc.getWorld() == null) {
                 return false;
