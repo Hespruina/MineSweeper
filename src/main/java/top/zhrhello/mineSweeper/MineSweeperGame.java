@@ -117,6 +117,9 @@ public class MineSweeperGame {
 
     private void showStartTitle() {
         final int mines = customMineCount;
+        // 对同一玩家去重：玩家站在平台上会被多个相邻方块的范围检测同时命中，
+        // 若不做去重，每个方块都会发一次，导致"游戏提示"等消息重复发送。
+        final Set<UUID> notified = ConcurrentHashMap.newKeySet();
         for (Location loc : platformBlocks) {
             Location upLoc = loc.clone().add(0, 1, 0);
             onRegion(upLoc, () -> {
@@ -124,9 +127,11 @@ public class MineSweeperGame {
                 for (Entity entity : entities) {
                     if (entity instanceof Player) {
                         Player player = (Player) entity;
-                        player.sendTitle(ChatColor.GOLD + "扫雷游戏", "雷数: " + mines, 10, 40, 10);
-                        player.sendMessage(ChatColor.GREEN + "游戏提示: 左键翻开方块，右键插旗标记地雷");
-                        player.sendMessage(ChatColor.GREEN + "数字表示周围8个格子中地雷的数量");
+                        if (notified.add(player.getUniqueId())) {
+                            player.sendTitle(ChatColor.GOLD + "扫雷游戏", "雷数: " + mines, 10, 40, 10);
+                            player.sendMessage(ChatColor.GREEN + "游戏提示: 左键翻开方块，右键插旗标记地雷");
+                            player.sendMessage(ChatColor.GREEN + "数字表示周围8个格子中地雷的数量");
+                        }
                     }
                 }
             });
@@ -825,6 +830,8 @@ public class MineSweeperGame {
 
     // 创建者点击"启动游戏"：结束等待状态，游戏正式开始
     public void startGame() {
+        // 幂等保护：避免重复点击启动导致"游戏已开始！"等消息重复发送
+        if (!this.waitingForStart) return;
         this.waitingForStart = false;
         this.lastActivityTime = System.currentTimeMillis();
         notifyPlayersOnPlatform(ChatColor.GREEN + "游戏已开始！左键揭示，右键插旗");
@@ -859,13 +866,19 @@ public class MineSweeperGame {
 
     // 向平台上所有玩家发送消息
     private void notifyPlayersOnPlatform(String message) {
+        // 对同一玩家去重：玩家站在平台上会被多个相邻方块的范围检测同时命中，
+        // 若不做去重，每个方块都会发一次，导致"游戏已开始！"等消息重复发送。
+        final Set<UUID> notified = ConcurrentHashMap.newKeySet();
         for (Location loc : platformBlocks) {
             Location upLoc = loc.clone().add(0, 1, 0);
             onRegion(upLoc, () -> {
                 Collection<Entity> entities = upLoc.getWorld().getNearbyEntities(upLoc, 0.5, 0.5, 0.5);
                 for (Entity entity : entities) {
                     if (entity instanceof Player) {
-                        ((Player) entity).sendMessage(message);
+                        Player player = (Player) entity;
+                        if (notified.add(player.getUniqueId())) {
+                            player.sendMessage(message);
+                        }
                     }
                 }
             });

@@ -259,6 +259,45 @@ public final class MineSweeperPlugin extends JavaPlugin {
         return false;
     }
 
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (!command.getName().equalsIgnoreCase("sweeper")) {
+            return null;
+        }
+
+        List<String> completions = new ArrayList<>();
+
+        if (args.length == 1) {
+            // 第一层参数：子命令
+            String prefix = args[0].toLowerCase();
+            boolean isPlayer = sender instanceof Player;
+            // reload 仅控制台或拥有 minesweeper.admin 的玩家可用，与其执行权限保持一致
+            boolean canReload = !isPlayer || sender.hasPermission("minesweeper.admin");
+
+            if ("list".startsWith(prefix)) completions.add("list");
+            if (canReload && "reload".startsWith(prefix)) completions.add("reload");
+            if (isPlayer) {
+                if ("win".startsWith(prefix)) completions.add("win");
+                if ("exit".startsWith(prefix)) completions.add("exit");
+                if ("see".startsWith(prefix)) completions.add("see");
+            }
+        } else if (args.length == 2) {
+            // 第二层参数：游戏序号（win/exit/see 需要）
+            String sub = args[0].toLowerCase();
+            if (sub.equals("win") || sub.equals("exit") || sub.equals("see")) {
+                String prefix = args[1];
+                for (int i = 1; i <= activeGames.size(); i++) {
+                    String idx = String.valueOf(i);
+                    if (idx.startsWith(prefix)) {
+                        completions.add(idx);
+                    }
+                }
+            }
+        }
+
+        return completions;
+    }
+
     // 添加新游戏
     public ConfigManager getConfigManager() { return configManager; }
     public Persistence getPersistence() { return persistence; }
