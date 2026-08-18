@@ -1,0 +1,36 @@
+name: Build
+
+# 在推送/合并到 main、拉取请求以及手动触发时，自动执行 mvn clean package，
+# 产出最新 MineSweeper 插件 jar，并以构建产物（Artifact）的形式提供下载。
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: 构建插件
+        run: mvn -B clean package
+
+      - name: 上传插件 jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: MineSweeper-plugin
+          path: target/MineSweeper-*.jar
+          if-no-files-found: error
+          retention-days: 7
