@@ -325,6 +325,31 @@ public class MineSweeperListener implements Listener {
         }
     }
 
+    /**
+     * 红石火把（旗帜）及平台方块被"任何方式"破坏时，一律不产生掉落物：
+     * - 防止玩家利用活塞顶掉旗帜刷红石火把；
+     * - 防止用爆炸/水流/火焰等非正常手段破坏平台方块（含"失败展示雷区/管理员查看"阶段的 TNT）刷物品。
+     *
+     * <p>玩家手挖旗帜的"取消旗子"逻辑仍在 {@link #onBlockBreak} 处理（取消事件并直接置空），
+     * 本事件不影响该流程。BlockDropItemEvent 仅在"方块被破坏且本应掉落物品"时触发，
+     * 游戏中通过 setType(AIR) 主动设置方块不会触发本事件。
+     */
+    @EventHandler
+    public void onBlockDropItem(BlockDropItemEvent event) {
+        Block block = event.getBlock();
+        if (block == null) return;
+        Location loc = block.getLocation();
+        // 平台方块层
+        MineSweeperGame game = plugin.getGameAt(loc);
+        // 火把层（旗帜，位于平台方块正上方一格）
+        if (game == null || !game.isActive()) {
+            game = plugin.getGameAt(loc.clone().add(0, -1, 0));
+        }
+        if (game != null && game.isActive()) {
+            event.setCancelled(true);
+        }
+    }
+
     // 防止实体交互干扰
     @EventHandler
     public void onEntityInteract(PlayerInteractEntityEvent event) {
@@ -384,38 +409,85 @@ public class MineSweeperListener implements Listener {
         }
         event.blockList().removeAll(blocksToRemove);
     }
-    
+
+    // 兜底：非实体爆炸（如重生锚/床）同样不允许破坏游戏平台及其正上方火把层
+    @EventHandler
+    public void onBlockExplode(BlockExplodeEvent event) {
+        Location center = event.getBlock().getLocation();
+        MineSweeperGame game = plugin.getGameAt(center);
+        if (game == null) {
+            game = plugin.getGameAt(center.clone().add(0, -1, 0));
+        }
+        // 双保险：若爆炸中心位于游戏平台上，整体取消该次爆炸
+        if (game != null && game.isActive()) {
+            event.setCancelled(true);
+            return;
+        }
+
+        // 平台外的爆炸：移除所有属于游戏平台及其正上方一层的方块
+        List<Block> blocksToRemove = new ArrayList<>();
+        for (Block block : event.blockList()) {
+            Location loc = block.getLocation();
+            MineSweeperGame g = plugin.getGameAt(loc);
+            if (g == null) {
+                // 检查是否位于平台方块正上方一层（火把/箱子层）
+                g = plugin.getGameAt(loc.clone().add(0, -1, 0));
+            }
+            if (g != null && g.isActive()) {
+                blocksToRemove.add(block);
+            }
+        }
+        event.blockList().removeAll(blocksToRemove);
+    }
+
     // 处理活塞推出游戏方块
     @EventHandler
     public void onBlockPistonExtend(BlockPistonExtendEvent event) {
-        // 检查移动的方块是否属于游戏区域
-        for (Block block : event.getBlocks()) {
-            Location loc = block.getLocation();
-            MineSweeperGame game = plugin.getGameAt(loc);
-            if (game != null && game.isActive()) {
-                // 终止游戏
-                game.endGame(false);
-                // 移除活塞
-                event.getBlock().setType(Material.AIR);
-                return;
-            }
-        }
+        handlePistonMovesPlatform(event.getBlocks(), event.getBlock());
     }
-    
+
     // 处理活塞收回游戏方块
     @EventHandler
     public void onBlockPistonRetract(BlockPistonRetractEvent event) {
-        // 检查移动的方块是否属于游戏区域
-        for (Block block : event.getBlocks()) {
+        handlePistonMovesPlatform(event.getBlocks(), event.getBlock());
+    }
+
+    /**
+     * 活塞推动/收回时若涉及游戏平台方块：先清掉被推动方块正上方的旗帜（红石火把），
+     * 再终止游戏并移除活塞。防止火把因支撑方块被活塞推开而掉落刷红石火把。
+     *
+     * <p>清火把放在 endGame 之前同步执行，可避开 Folia 下 endGame 重置方块跨 region 异步
+     * 造成的"游戏已移除、火把尚未置空"窗口，确保不会掉落物品。
+     */
+    private void handlePistonMovesPlatform(List<Block> blocks, Block pistonBlock) {
+        MineSweeperGame gameToEnd = null;
+        for (Block block : blocks) {
             Location loc = block.getLocation();
             MineSweeperGame game = plugin.getGameAt(loc);
             if (game != null && game.isActive()) {
-                // 终止游戏
-                game.endGame(false);
-                // 移除活塞
-                event.getBlock().setType(Material.AIR);
-                return;
+                clearFlagTorchAbove(loc);
+                if (gameToEnd == null) {
+                    gameToEnd = game;
+                }
             }
+        }
+        if (gameToEnd != null) {
+            gameToEnd.endGame(false);
+            if (pistonBlock != null) {
+                pistonBlock.setType(Material.AIR);
+            }
+        }
+    }
+
+    // 移除方块正上方的旗帜（红石火把），直接置空不产生掉落物
+    private void clearFlagTorchAbove(Location platformLoc) {
+        try {
+            Location torchLoc = platformLoc.clone().add(0, 1, 0);
+            if (torchLoc.getBlock().getType() == Material.REDSTONE_TORCH) {
+                torchLoc.getBlock().setType(Material.AIR);
+            }
+        } catch (Throwable t) {
+            // Folia 下跨 region 访问可能抛异常，跳过；漏网火把的掉落由 onBlockDropItem 兜底
         }
     }
     
