@@ -60,8 +60,10 @@ public class MineSweeperListener implements Listener {
         // 清理后再检查平台上是否仍残留方块（如清理不掉的他人商店），有则拒绝开启游戏。
         clearLeftoverChests(platform, event.getPlayer());
 
-        // 检查平台上是否仍残留其它方块（箱子、火把等），有则拒绝开启游戏
-        Material leftover = findLeftoverBlock(platform);
+        // 检查平台上是否仍残留其它方块（箱子、火把等），有则拒绝开启游戏。
+        // 需要排除刚放置用于启动游戏的 TNT：BlockPlaceEvent 触发时 TNT 已存在于世界中，
+        // 若不排除，该 TNT 会被误判为"残留方块"，导致游戏永远无法开启。
+        Material leftover = findLeftoverBlock(platform, event.getBlock().getLocation());
         if (leftover != null) {
             if (leftover == Material.CHEST) {
                 event.getPlayer().sendMessage(ChatColor.RED + "平台上仍有遗留的箱子，请先清理后再开启游戏！");
@@ -243,9 +245,16 @@ public class MineSweeperListener implements Listener {
      * 下一局清理，若清理被保护插件拦截（如他人的 QuickShop 商店），箱子会保留在平台上。
      * 平台上方存在任何非空气方块（箱子/火把/其它）时返回该方块类型，否则返回 null。
      */
-    private Material findLeftoverBlock(Set<Location> platform) {
+    private Material findLeftoverBlock(Set<Location> platform, Location startLocation) {
         for (Location loc : platform) {
             Location up = loc.clone().add(0, 1, 0);
+            // 跳过刚放置的启动 TNT（位于平台方块正上方一层），避免误判为残留方块
+            if (startLocation != null && up.getWorld().equals(startLocation.getWorld())
+                    && up.getBlockX() == startLocation.getBlockX()
+                    && up.getBlockY() == startLocation.getBlockY()
+                    && up.getBlockZ() == startLocation.getBlockZ()) {
+                continue;
+            }
             Material type;
             try {
                 // 只读 getType()：与 detectPlatform 同理，chunk 已加载时在 Folia 上安全
