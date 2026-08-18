@@ -56,6 +56,21 @@ public class MineSweeperListener implements Listener {
             return;
         }
 
+        // 先尝试清理上一局遗留的奖励箱子（以创建者身份模拟挖掘，QuickShop 会拦截他人的商店），
+        // 清理后再检查平台上是否仍残留方块（如清理不掉的他人商店），有则拒绝开启游戏。
+        clearLeftoverChests(platform, event.getPlayer());
+
+        // 检查平台上是否仍残留其它方块（箱子、火把等），有则拒绝开启游戏
+        Material leftover = findLeftoverBlock(platform);
+        if (leftover != null) {
+            if (leftover == Material.CHEST) {
+                event.getPlayer().sendMessage(ChatColor.RED + "平台上仍有遗留的箱子，请先清理后再开启游戏！");
+            } else {
+                event.getPlayer().sendMessage(ChatColor.RED + "平台上仍有其它方块，请先清理后再开启游戏！");
+            }
+            return;
+        }
+
         // 检查平台方块是否已被其他进行中的游戏占用
         for (Location loc : platform) {
             MineSweeperGame existing = plugin.getGameAt(loc);
@@ -190,6 +205,59 @@ public class MineSweeperListener implements Listener {
             }
         }
         return false;
+    }
+
+    /**
+     * 清理平台上遗留的奖励箱子：以 actor 身份「模拟挖掘」（触发 BlockBreakEvent），
+     * 而不是直接 setType(AIR)。QuickShop 等保护插件会在事件中拦截属于他人的商店
+     * （事件被取消、箱子保留），普通的遗留奖励箱子则按原版规则正常掉落。
+     * 清理后仍残留的方块（如被拦截的他人商店）由 findLeftoverBlock 检出并拒绝开游戏。
+     *
+     * <p>线程说明：本方法由 {@code onTNTPlace} 直接同步调用，而 onTNTPlace 运行在
+     * 玩家放置 TNT 的方块所属 region 线程（Paper 为主线程，Folia 为玩家实体所在 region，
+     * 因玩家与刚放置的 TNT 同 region）。因此这里<b>不需要</b>再用 runOnRegionOwned 转发——
+     * 那样反而会把 breakBlock 调度到「箱子方块」的 region 线程，导致 Folia 下跨 region
+     * 访问玩家/方块。直接在当前线程同步挖掘，跨 region 的方块由 try-catch 兜底跳过
+     * （该箱子残留，最终由 findLeftoverBlock 检出并拒绝开游戏，安全失败而非崩溃）。
+     */
+    private void clearLeftoverChests(Set<Location> platform, Player actor) {
+        if (actor == null || !actor.isOnline()) return;
+        for (Location loc : platform) {
+            Location up = loc.clone().add(0, 1, 0);
+            try {
+                Block block = up.getBlock();
+                if (block.getType() == Material.CHEST) {
+                    // 触发 BlockBreakEvent，让 QuickShop 等保护插件有机会拦截
+                    actor.breakBlock(block);
+                }
+            } catch (Throwable t) {
+                // Folia 下平台跨 region 时，非本 region 的箱子会抛异常，跳过即可
+                plugin.getLogger().warning("[MineSweeper] 清理遗留箱子异常: " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 检查平台上方一层（火把/箱子层）是否仍有残留方块。
+     * 正常游戏结束后平台会还原为灰色混凝土、火把被清除；但奖励箱子依赖玩家挖掘或
+     * 下一局清理，若清理被保护插件拦截（如他人的 QuickShop 商店），箱子会保留在平台上。
+     * 平台上方存在任何非空气方块（箱子/火把/其它）时返回该方块类型，否则返回 null。
+     */
+    private Material findLeftoverBlock(Set<Location> platform) {
+        for (Location loc : platform) {
+            Location up = loc.clone().add(0, 1, 0);
+            Material type;
+            try {
+                // 只读 getType()：与 detectPlatform 同理，chunk 已加载时在 Folia 上安全
+                type = up.getBlock().getType();
+            } catch (Throwable t) {
+                continue; // chunk 未加载等极端情况，跳过
+            }
+            if (type != Material.AIR) {
+                return type;
+            }
+        }
+        return null;
     }
 
     // 左/右键点击处理
@@ -408,10 +476,10 @@ public class MineSweeperListener implements Listener {
                         playerGames.remove(player.getUniqueId());
                         return;
                     }
+                    // 先解散（置 waitingForStart=false）再关 GUI，避免关闭事件误判为"放弃创建"
+                    game.timeoutCancel(ChatColor.RED + "游戏已取消，平台已释放");
                     player.closeInventory();
-                    game.timeoutCancel();
                     playerGames.remove(player.getUniqueId());
-                    player.sendMessage(ChatColor.RED + "游戏已取消");
                     return;
                 }
 
@@ -424,8 +492,9 @@ public class MineSweeperListener implements Listener {
                         playerGames.remove(player.getUniqueId());
                         return;
                     }
-                    player.closeInventory();
+                    // 先启动（置 waitingForStart=false）再关 GUI，避免关闭事件误判为"放弃创建"
                     game.startGame();
+                    player.closeInventory();
                     player.sendMessage(ChatColor.GREEN + "游戏已启动！左键揭示，右键插旗");
                     player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.0f, 1.0f);
                     // 移除玩家与游戏的关联，因为游戏已经启动
@@ -454,10 +523,17 @@ public class MineSweeperListener implements Listener {
 
         if (!isOurGUI(event.getInventory())) return;
 
-        // 切换开关/难度时的"先关后开"属于程序化重开，不应清理关联
+        // 切换开关/难度时的"先关后开"属于程序化重开，不应清理关联/解散
         if (reopeningGUI.contains(player.getUniqueId())) return;
 
+        MineSweeperGame game = playerGames.get(player.getUniqueId());
         playerGames.remove(player.getUniqueId());
+
+        // 创建者直接关闭 GUI（如按 ESC）：视为放弃创建，立即解散游戏并释放平台
+        if (game != null && game.isWaitingForStart()
+                && game.getCreator() != null && game.getCreator().equals(player)) {
+            game.timeoutCancel(ChatColor.RED + "已放弃创建，游戏已解散，平台已释放");
+        }
     }
 
     // 玩家退出服务器：无论其 GUI 是否关闭，都清理关联，防止内存泄漏。

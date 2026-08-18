@@ -2,7 +2,6 @@ package top.zhrhello.mineSweeper;
 
 import org.bukkit.*;
 import org.bukkit.block.Block;
-import org.bukkit.block.Chest;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
@@ -59,9 +58,9 @@ public class MineSweeperGame {
         this.mineCount = Math.max(1, (int) (totalBlocks * 0.15));
         this.customMineCount = this.mineCount;
 
-        // 新一局开始时，先把上一局遗留的奖励箱子破坏并掉落其内容与箱子本身，
-        // 解决玩家有时不挖箱子、导致奖励丢失的问题
-        clearLeftoverChests();
+        // 注意：上一局遗留的奖励箱子清理已前移到 MineSweeperListener.onTNTPlace 中
+        // （先模拟挖掘清理，再检查是否仍有残留方块，有则拒绝开新游戏），
+        // 构造时平台已保证干净，故这里不再重复清理。
 
         // 初始化平台为灰色混凝土
         initializePlatform();
@@ -85,33 +84,6 @@ public class MineSweeperGame {
     private void initializePlatform() {
         for (Location loc : platformBlocks) {
             setBlockType(loc, Material.GRAY_CONCRETE);
-        }
-    }
-
-    // 新一局开始时清理上一局遗留的奖励箱子：将其与箱内物品全部变为掉落物。
-    // 这样即便玩家上一局没有挖掉箱子，奖励也不会丢——新游戏一开局就掉在地上可拾取。
-    private void clearLeftoverChests() {
-        for (Location loc : platformBlocks) {
-            Location up = loc.clone().add(0, 1, 0);
-            onRegion(up, () -> {
-                Block block = up.getBlock();
-                if (block.getType() != Material.CHEST) return;
-
-                Chest chest = (Chest) block.getState();
-                Location dropLoc = up.clone().add(0.5, 0.5, 0.5);
-
-                // 掉落箱子本身
-                block.getWorld().dropItemNaturally(dropLoc, new ItemStack(Material.CHEST));
-                // 掉落箱内所有物品
-                for (ItemStack item : chest.getInventory().getContents()) {
-                    if (item != null && item.getType() != Material.AIR) {
-                        block.getWorld().dropItemNaturally(dropLoc, item);
-                    }
-                }
-                // 清空并移除箱子方块
-                chest.getInventory().clear();
-                block.setType(Material.AIR);
-            });
         }
     }
 
@@ -200,25 +172,27 @@ public class MineSweeperGame {
         // 创建位置副本以防止外部修改
         Location clickedLoc = loc.clone();
 
-        // 检查是否插旗
+        // 左键点击已插旗的格子：不翻开（旗子保护）
         if (flaggedBlocks.contains(clickedLoc)) {
-            // 如果已经标记旗帜，允许连锁翻开
-            if (revealedBlocks.contains(clickedLoc)) {
-                int number = numbers.getOrDefault(clickedLoc, 0);
-                if (number > 0) {
-                    int flaggedNeighbors = countFlaggedNeighbors(clickedLoc);
-                    if (flaggedNeighbors == number) {
-                        revealNeighbors(clickedLoc, player);
-                        // 连锁翻开后执行一次自动标雷
-                        if (autoFlagEnabled && isLargeEnoughForAutoFlag() && active && !waitingForExit) {
-                            autoFlagMines();
-                        }
-                        player.playSound(player.getLocation(), Sound.BLOCK_STONE_BUTTON_CLICK_ON, 1.0f, 1.0f);
-                    } else if (flaggedNeighbors > number) {
-                        player.sendMessage(ChatColor.RED + "标记数超过提示数字，请检查标记!");
-                        player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 1.0f, 1.0f);
-                        return;
+            return;
+        }
+
+        // 左键点击已翻开的数字格：触发连锁翻开（chord，标准扫雷逻辑）
+        if (revealedBlocks.contains(clickedLoc)) {
+            lastActivityTime = System.currentTimeMillis();
+            int number = numbers.getOrDefault(clickedLoc, 0);
+            if (number > 0) {
+                int flaggedNeighbors = countFlaggedNeighbors(clickedLoc);
+                if (flaggedNeighbors == number) {
+                    revealNeighbors(clickedLoc, player);
+                    // 连锁翻开后执行一次自动标雷
+                    if (autoFlagEnabled && isLargeEnoughForAutoFlag() && active && !waitingForExit) {
+                        autoFlagMines();
                     }
+                    player.playSound(player.getLocation(), Sound.BLOCK_STONE_BUTTON_CLICK_ON, 1.0f, 1.0f);
+                } else if (flaggedNeighbors > number) {
+                    player.sendMessage(ChatColor.RED + "标记数超过提示数字，请检查标记!");
+                    player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 1.0f, 1.0f);
                 }
             }
             return;
@@ -362,12 +336,9 @@ public class MineSweeperGame {
         return count;
     }
 
-    // 自动标记功能 - 削弱版
+    // 自动标记功能 - 削弱版（仅标记地雷，不自动翻开方块）
     private void autoFlagMines() {
-        boolean changed = false;
-
-        // 只创建一次快照以避免 ConcurrentModificationException（循环体内 revealBlock
-        // 会向 revealedBlocks 添加元素）；两段逻辑共用同一份快照，无需复制两次。
+        // 只创建一次快照以避免遍历过程中集合被修改
         Set<Location> snapshot = new HashSet<>(revealedBlocks);
 
         // 削弱自动标记功能 - 只处理确定性标记（只当未标记邻居数等于剩余雷数时才标记）
@@ -392,37 +363,6 @@ public class MineSweeperGame {
                                 !flaggedBlocks.contains(neighbor) &&
                                 isMine.getOrDefault(neighbor, false)) {
                                 placeFlag(neighbor);
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 如果有新的标记被放置，检查是否可以触发连锁翻开（复用同一份快照）
-        if (changed) {
-            for (Location loc : snapshot) {
-                int number = numbers.getOrDefault(loc, 0);
-                if (number > 0) {
-                    int flaggedNeighbors = countFlaggedNeighbors(loc);
-                    int unrevealedNeighbors = countUnrevealedNeighbors(loc);
-
-                    // 如果标记数等于提示数字，且还有未翻开的方块
-                    if (flaggedNeighbors == number && unrevealedNeighbors > 0) {
-                        // 翻开所有未标记的邻居
-                        for (int dx = -1; dx <= 1; dx++) {
-                            for (int dz = -1; dz <= 1; dz++) {
-                                if (dx == 0 && dz == 0) continue;
-                                Location neighbor = loc.clone().add(dx, 0, dz);
-                                if (platformBlocks.contains(neighbor) &&
-                                    !revealedBlocks.contains(neighbor) &&
-                                    !flaggedBlocks.contains(neighbor)) {
-                                    // 不要翻开地雷
-                                    if (!isMine.getOrDefault(neighbor, false)) {
-                                        revealBlock(neighbor);
-                                    }
-                                }
                             }
                         }
                     }
@@ -842,6 +782,14 @@ public class MineSweeperGame {
      * 不触发任何胜负奖励。通过插件调度在主线程执行。
      */
     public void timeoutCancel() {
+        timeoutCancel(ChatColor.RED + "创建者超时未启动游戏，本局已解散");
+    }
+
+    /**
+     * 解散游戏（还原平台、移除游戏），不触发任何胜负奖励。
+     * @param message 广播给平台上玩家的提示（超时 / 取消 / 放弃创建等场景）。
+     */
+    public void timeoutCancel(String message) {
         if (!active) return;
         active = false;
         waitingForStart = false;
@@ -861,7 +809,7 @@ public class MineSweeperGame {
         flaggedBlocks.clear();
         revealedBlocks.clear();
 
-        notifyPlayersOnPlatform(ChatColor.RED + "创建者超时未启动游戏，本局已解散");
+        notifyPlayersOnPlatform(message);
     }
 
     // 向平台上所有玩家发送消息

@@ -19,9 +19,12 @@ import top.zhrhello.mineSweeper.logic.GameContext;
 import top.zhrhello.mineSweeper.logic.LogicEngine;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -194,47 +197,74 @@ public class RewardManager {
             ac.plugin.getLogger().warning("[Reward] give_chest 缺少平台信息，已跳过");
             return;
         }
-        // 在每个候选位置所属 region 线程查找空气并放置箱子（支持平台跨 region）。
-        // 用 AtomicBoolean 保证只放置一个箱子。
-        java.util.concurrent.atomic.AtomicBoolean placed = new java.util.concurrent.atomic.AtomicBoolean(false);
-        for (Location loc : g.platformBlocks) {
-            if (placed.get()) break;
+
+        // 只执行一次 Logic 函数，把战利品拆成叠堆列表（每叠不超过材质最大堆叠数）
+        Object ret = ac.engine.execute(funcName, new ArrayList<>(), g);
+        List<ItemStack> stacks = buildLootStacks(ret, ac);
+        if (stacks.isEmpty()) {
+            return; // 没有战利品，不放置空箱子
+        }
+
+        // 每个箱子最多 27 叠，按 27 一批拆分；战利品过多时自动放置多个箱子
+        List<List<ItemStack>> batches = new ArrayList<>();
+        for (int i = 0; i < stacks.size(); i += 27) {
+            batches.add(new ArrayList<>(stacks.subList(i, Math.min(i + 27, stacks.size()))));
+        }
+
+        // 随机洗牌平台方块作为候选位置：箱子每次落在完全随机的位置
+        List<Location> candidates = new ArrayList<>(g.platformBlocks);
+        Collections.shuffle(candidates, ThreadLocalRandom.current());
+
+        int need = batches.size();
+        AtomicInteger placedCount = new AtomicInteger(0);
+
+        // 遍历随机候选位置，在各自 region 线程检查空气并放置箱子。
+        // 用原子计数保证恰好放置 need 个箱子；平台跨 region 时并发安全。
+        for (Location loc : candidates) {
+            if (placedCount.get() >= need) break;
             Location up = loc.clone().add(0, 1, 0);
             SchedulerCompat.runOnRegionOwned(ac.plugin, up, () -> {
-                if (placed.get()) return;
                 if (up.getBlock().getType() != Material.AIR) return;
-                if (!placed.compareAndSet(false, true)) return;
+                int idx = placedCount.getAndIncrement();
+                if (idx >= need) return;
                 up.getBlock().setType(Material.CHEST);
                 Chest chest = (Chest) up.getBlock().getState();
                 Inventory inv = chest.getInventory();
-                Object ret = ac.engine.execute(funcName, new ArrayList<>(), g);
-                fillChest(inv, ret, ac);
+                for (ItemStack stack : batches.get(idx)) {
+                    inv.addItem(stack);
+                }
             });
         }
     }
 
-    private void fillChest(Inventory inv, Object ret, ActionContext ac) {
+    /**
+     * 把 Logic 函数返回值解析为战利品叠堆列表（每叠不超过材质最大堆叠数）。
+     * 支持返回值类型：列表（元素为 "材质:数量"）、映射（材质 → 数量）、单个 "材质:数量" 字符串。
+     */
+    private List<ItemStack> buildLootStacks(Object ret, ActionContext ac) {
+        List<ItemStack> stacks = new ArrayList<>();
         if (ret instanceof List) {
             for (Object o : (List<?>) ret) {
-                addItemFromString(inv, Expression.toStr(o), ac);
+                addStackFromString(stacks, Expression.toStr(o), ac);
             }
         } else if (ret instanceof Map) {
             for (Map.Entry<?, ?> e : ((Map<?, ?>) ret).entrySet()) {
                 String mat = Expression.toStr(e.getKey());
                 int amt = (int) Math.floor(Expression.toDouble(e.getValue()));
-                addItem(inv, mat, amt, ac);
+                addStack(stacks, mat, amt, ac);
             }
         } else if (ret instanceof String) {
-            addItemFromString(inv, (String) ret, ac);
+            addStackFromString(stacks, (String) ret, ac);
         } else {
-            ac.plugin.getLogger().warning("[Reward] give_chest 函数返回值不是列表/映射，已跳过填充");
+            ac.plugin.getLogger().warning("[Reward] give_chest 函数返回值不是列表/映射/字符串，已跳过填充");
         }
+        return stacks;
     }
 
-    private void addItemFromString(Inventory inv, String s, ActionContext ac) {
+    private void addStackFromString(List<ItemStack> stacks, String s, ActionContext ac) {
         if (s == null || s.isEmpty()) return;
         String[] parts = s.split(":");
-        String mat = parts[0];
+        String mat = parts[0].trim();
         int amt = 1;
         if (parts.length >= 2) {
             try {
@@ -243,7 +273,22 @@ public class RewardManager {
                 amt = 1;
             }
         }
-        addItem(inv, mat, amt, ac);
+        addStack(stacks, mat, amt, ac);
+    }
+
+    private void addStack(List<ItemStack> stacks, String matName, int amt, ActionContext ac) {
+        if (amt <= 0) return;
+        Material m = Material.matchMaterial(matName);
+        if (m == null) {
+            ac.plugin.getLogger().warning("[Reward] 未知物品材质: " + matName);
+            return;
+        }
+        int max = m.getMaxStackSize();
+        while (amt > 0) {
+            int cur = Math.min(amt, max);
+            stacks.add(new ItemStack(m, cur));
+            amt -= cur;
+        }
     }
 
     private void addItem(Inventory inv, String matName, int amt, ActionContext ac) {
