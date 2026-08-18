@@ -1,5 +1,5 @@
 name: MineSweeper
-version: '1.2'
+version: '1.2.1'
 main: top.zhrhello.mineSweeper.MineSweeperPlugin
 api-version: '1.20'
 folia-supported: true
